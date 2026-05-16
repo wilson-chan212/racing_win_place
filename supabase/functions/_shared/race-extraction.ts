@@ -147,44 +147,13 @@ export function createServiceSupabase(env: ProjectSupabaseEnv) {
   })
 }
 
-export async function getAuthenticatedUserId(env: ProjectSupabaseEnv, req: Request) {
-  const authHeader = req.headers.get('Authorization') ?? ''
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim()
+/** Single app tenant (must match migration default `created_by`). */
+const DEFAULT_SINGLE_TENANT_USER_ID = '00000000-0000-4000-a000-000000000001'
 
-  if (!token) {
-    throw new ExtractRaceError({ error: 'Unauthorized (anonymous session required)' }, 401)
-  }
-
-  // Supabase JS sends the anon/publishable key as Bearer when no user session exists.
-  if (token === env.anonKey) {
-    throw new ExtractRaceError(
-      {
-        error: 'Unauthorized (anonymous session required)',
-        details:
-          'Request used the anon key as Bearer. Complete anonymous sign-in in the app, then retry (Supabase Auth → Providers → Anonymous).'
-      },
-      401
-    )
-  }
-
-  /** Validate JWT with Auth server — service role is reliable; anon/publishable keys often break getUser in Edge Functions. */
-  const admin = createClient(env.supabaseUrl, env.serviceKey, {
-    auth: { persistSession: false }
-  })
-
-  const { data: userData, error: userErr } = await admin.auth.getUser(token)
-  if (userErr || !userData?.user?.id) {
-    throw new ExtractRaceError(
-      {
-        error: 'Unauthorized (anonymous session required)',
-        details:
-          userErr?.message ??
-          'Invalid or expired JWT — ensure PROJECT_SUPABASE_URL / keys match your app project, enable Anonymous Auth, and invoke with the user session (not anon key Bearer).'
-      },
-      401
-    )
-  }
-  return userData.user.id
+export function readSingleTenantUserId(): string {
+  const v = Deno.env.get('SINGLE_TENANT_USER_ID')?.trim()
+  if (v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return v
+  return DEFAULT_SINGLE_TENANT_USER_ID
 }
 
 export function buildUrl(raceDate: string, meetingCode: string, raceNo: number) {
@@ -317,7 +286,7 @@ export async function upsertLatestRaceResults(
 
   const { data, error } = await supabase
     .from('race_results')
-    .upsert(rows, { onConflict: 'created_by,race_date,meeting_code,race_no,horse_no' })
+    .upsert(rows, { onConflict: 'race_date,meeting_code,race_no,horse_no' })
     .select(
       'race_date,meeting_code,race_no,horse_no,horse_name,barrier,jockey_name,trainer_name,win,place,withdrawn'
     )

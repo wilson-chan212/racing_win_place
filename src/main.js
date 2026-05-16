@@ -60,6 +60,8 @@ let hideWithdrawnClickDelegationAbort = null
 let highlighterClickDelegationAbort = null
 
 const HIGHLIGHT_STORAGE_KEY = 'projectRace_cellHighlights'
+/** Remember 即時／預定 tab so reload keeps the same Supabase-backed view. */
+const BOTTOM_TAB_STORAGE_KEY = 'projectRace_bottomTab'
 
 function getHighlightedKeys() {
   if (!getHighlightedKeys._cache) {
@@ -141,33 +143,23 @@ function liveOddsTableHeadRow() {
     .join('')}</tr>`
 }
 
-async function ensureAnonymousSession() {
-  assertSupabaseConfigured()
-  const { data: sessionData } = await supabase.auth.getSession()
-  if (sessionData?.session) {
-    const { data: userData, error: userError } = await supabase.auth.getUser()
-    if (!userError && userData?.user?.id) return sessionData.session
-    await supabase.auth.signOut()
+function persistBottomTab(which) {
+  if (which !== 'live' && which !== 'scheduled') return
+  try {
+    localStorage.setItem(BOTTOM_TAB_STORAGE_KEY, which)
+  } catch {
+    // ignore quota / privacy mode
   }
-
-  // Anonymous sign-in (no UI login)
-  const { data, error } = await supabase.auth.signInAnonymously()
-  if (error) throw new Error(error.message)
-  return data.session
 }
 
-/** Fresh user JWT for Edge Functions (never fall back to anon key Bearer). */
-async function getUserAccessTokenForEdgeFunctions() {
-  await ensureAnonymousSession()
-  await supabase.auth.refreshSession().catch(() => {})
-  const { data } = await supabase.auth.getSession()
-  const token = data.session?.access_token
-  if (!token) {
-    throw new Error(
-      '無法取得匿名登入憑證。請於 Supabase：Authentication → Providers → Anonymous 啟用登入（本地請確認 supabase/config.toml 為 enable_anonymous_sign_ins = true）。'
-    )
+/** Restore tab before first paint (jobs/results load in mount after Supabase gates). */
+function restoreBottomTabFromStorage() {
+  try {
+    const v = localStorage.getItem(BOTTOM_TAB_STORAGE_KEY)
+    if (v === 'scheduled' || v === 'live') state.ui.bottomTab = v
+  } catch {
+    /* ignore */
   }
-  return token
 }
 
 function escapeHtml(s) {
@@ -907,8 +899,7 @@ function syncHkjcWpLinkHref() {
 function refreshLiveOddsTableQuiet() {
   const quietFilter = readFilterQuiet()
   if (!supabase || !quietFilter) return
-  ensureAnonymousSession()
-    .then(() => loadLatestResults(quietFilter))
+  loadLatestResults(quietFilter)
     .then(() => {
       renderLiveOddsTable()
     })
@@ -980,7 +971,6 @@ function scheduleRefreshRaceSubtitle(delayMs = 0) {
 
 async function loadLatestResults({ raceDate, meetingCode, raceNo }) {
   assertSupabaseConfigured()
-  await ensureAnonymousSession()
   const { data, error } = await supabase
     .from('race_results')
     .select('horse_no,horse_name,barrier,jockey_name,trainer_name,win,place,withdrawn')
@@ -1002,10 +992,7 @@ async function loadLatestResults({ raceDate, meetingCode, raceNo }) {
 
 async function runExtractNow({ raceDate, meetingCode, raceNo }) {
   assertSupabaseConfigured()
-  const token = await getUserAccessTokenForEdgeFunctions()
-  // Explicit Bearer: supabase-js otherwise uses anon key when getSession briefly has no JWT.
   const { data, error } = await supabase.functions.invoke('extract-race-results', {
-    headers: { Authorization: `Bearer ${token}` },
     body: { raceDate, meetingCode, raceNo }
   })
   if (error) throw new Error(await readFunctionError(error))
@@ -1024,9 +1011,7 @@ function hasDuePendingJobs(jobs = state.scheduled.jobs) {
 
 async function processDueScheduledJobs() {
   assertSupabaseConfigured()
-  const token = await getUserAccessTokenForEdgeFunctions()
   const { data, error } = await supabase.functions.invoke('process-user-due-extractions', {
-    headers: { Authorization: `Bearer ${token}` },
     body: {}
   })
   if (error) throw new Error(await readFunctionError(error))
@@ -1058,7 +1043,6 @@ function startScheduleDuePoll() {
 async function loadScheduledData(force = false, { processDue = true } = {}) {
   const scope = readScheduledScopeFilter()
   assertSupabaseConfigured()
-  await ensureAnonymousSession()
 
   const key = `${scope.raceDate}:${scope.meetingCode}`
   if (!force && state.scheduled.loadedKey === key && state.scheduled.jobs.length) return
@@ -1114,8 +1098,6 @@ async function saveScheduleTimes() {
   if (!raceNos.length) throw new Error('請至少選擇一個預定場次')
 
   assertSupabaseConfigured()
-  const session = await ensureAnonymousSession()
-  const createdBy = session.user.id
   const uniqueTimes = [...new Set(state.scheduled.draftTimes.map((time) => time.trim()).filter(Boolean))]
 
   if (!uniqueTimes.length) throw new Error('請新增至少一個預定時間')
@@ -1126,7 +1108,6 @@ async function saveScheduleTimes() {
       const date = new Date(time)
       if (Number.isNaN(date.getTime())) throw new Error('請填寫正確的預定時間')
       rowsToInsert.push({
-        created_by: createdBy,
         race_date: scope.raceDate,
         meeting_code: scope.meetingCode,
         race_no: raceNo,
@@ -1145,7 +1126,6 @@ async function saveScheduleTimes() {
 
 async function deleteScheduleJob(id) {
   assertSupabaseConfigured()
-  await ensureAnonymousSession()
   const { error } = await supabase
     .from('race_extraction_jobs')
     .delete()
@@ -1158,7 +1138,6 @@ async function deleteScheduleJob(id) {
 
 async function deleteScheduleJobRecord(id) {
   assertSupabaseConfigured()
-  await ensureAnonymousSession()
   const { error } = await supabase
     .from('race_extraction_jobs')
     .delete()
@@ -1192,6 +1171,7 @@ async function readFunctionError(error) {
 function setBottomTab(which) {
   if (which !== 'live' && which !== 'scheduled') return
   state.ui.bottomTab = which
+  persistBottomTab(which)
   const live = which === 'live'
 
   const pLive = document.querySelector('#panelLive')
@@ -1427,6 +1407,7 @@ function resetScheduledLoadedKey() {
 }
 
 async function bootstrap() {
+  restoreBottomTabFromStorage()
   await loadMeetingsForSelectedDate()
 }
 
@@ -1508,13 +1489,6 @@ function mount() {
 
   syncHighlighterModeDom()
 
-  // Warm up anonymous session early (best-effort)
-  if (supabase) {
-    ensureAnonymousSession().catch(() => {
-      // ignore; UI actions will show message
-    })
-  }
-
   const raceNoInput = document.querySelector('#raceNo')
 
   function bumpRaceNo(delta) {
@@ -1576,6 +1550,12 @@ function mount() {
   syncHkjcWpLinkHref()
   syncLiveOnlyChrome()
   if (supabase) renderScheduleRacePickInDom()
+
+  /** Re-apply tab visibility/pollers from state (handles restored 「預定」 tab after refresh). */
+  setBottomTab(state.ui.bottomTab)
+  if (state.ui.bottomTab === 'scheduled' && supabase) {
+    loadScheduledData().catch((e) => showToast(String(e?.message ?? e)))
+  }
 
   document.querySelector('#tabLiveBtn')?.addEventListener('click', () => {
     if (state.ui.bottomTab === 'live') return

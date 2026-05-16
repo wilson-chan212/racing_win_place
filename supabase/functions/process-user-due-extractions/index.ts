@@ -1,13 +1,11 @@
 // Supabase Edge Function (Deno)
-// POST with user JWT (anonymous session).
-// Processes due pending race_extraction_jobs for the authenticated user only.
+// POST with anon key — processes due pending jobs (single-tenant deployment).
 
 import {
   createServiceSupabase,
   corsHeaders,
   ExtractRaceError,
   extractRaceOdds,
-  getAuthenticatedUserId,
   json,
   readProjectSupabaseEnv,
   upsertLatestRaceResults,
@@ -36,7 +34,6 @@ Deno.serve(async (req) => {
 
   try {
     const env = readProjectSupabaseEnv()
-    const userId = await getAuthenticatedUserId(env, req)
     const supabase = createServiceSupabase(env)
     const nowIso = new Date().toISOString()
 
@@ -44,7 +41,6 @@ Deno.serve(async (req) => {
       .from('race_extraction_jobs')
       .select('id,created_by,race_date,meeting_code,race_no,scheduled_at')
       .eq('status', 'pending')
-      .eq('created_by', userId)
       .lte('scheduled_at', nowIso)
       .order('scheduled_at', { ascending: true })
       .limit(10)

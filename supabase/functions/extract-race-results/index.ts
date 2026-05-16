@@ -7,10 +7,10 @@ import {
   corsHeaders,
   ExtractRaceError,
   extractRaceOdds,
-  getAuthenticatedUserId,
   isISODate,
   json,
   readProjectSupabaseEnv,
+  readSingleTenantUserId,
   safeInt,
   upsertLatestRaceResults
 } from '../_shared/race-extraction.ts'
@@ -42,7 +42,7 @@ Deno.serve(async (req) => {
     if (!raceNo || raceNo < 1 || raceNo > 99) return json({ error: 'raceNo invalid' }, 400)
 
     const env = readProjectSupabaseEnv()
-    const userId = await getAuthenticatedUserId(env, req)
+    const userId = readSingleTenantUserId()
     const extracted = await extractRaceOdds(raceDate, meetingCode, raceNo)
     const supabase = createServiceSupabase(env)
     const data = await upsertLatestRaceResults(supabase, {
