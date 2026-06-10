@@ -7,15 +7,62 @@ import {
   fetchRaceSubtitle
 } from './lib/hkjcRaceMeta.js'
 
+const HK_TZ = 'Asia/Hong_Kong'
+
 function hongKongDateInputValue(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Hong_Kong',
+    timeZone: HK_TZ,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit'
   }).formatToParts(date)
   const get = (type) => parts.find((p) => p.type === type)?.value
   return `${get('year')}-${get('month')}-${get('day')}`
+}
+
+function hkDateTimeParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: HK_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).formatToParts(date)
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? ''
+  return { year: get('year'), month: get('month'), day: get('day'), hour: get('hour'), minute: get('minute') }
+}
+
+/** `datetime-local` value interpreted as Hong Kong wall time (UTC+8, no DST). */
+function toDateTimeLocalValueHK(date = new Date()) {
+  const p = hkDateTimeParts(date)
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`
+}
+
+function parseHKDateTimeLocalToISO(value) {
+  const m = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/)
+  if (!m) throw new Error('請填寫正確的預定時間')
+  const isoLocal = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00+08:00`
+  const date = new Date(isoLocal)
+  if (Number.isNaN(date.getTime())) throw new Error('請填寫正確的預定時間')
+  return date.toISOString()
+}
+
+function formatDateTimeHK(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  const p = hkDateTimeParts(date)
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`
+}
+
+function formatMonthDayHmHK(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const p = hkDateTimeParts(date)
+  return `${Number(p.month)}月${Number(p.day)} ${p.hour}:${p.minute}`
 }
 
 const state = {
@@ -40,7 +87,7 @@ const state = {
     highlighterMode: false
   },
   scheduled: {
-    draftTimes: [toDateTimeLocalValue(new Date(Date.now() + 5 * 60 * 1000))],
+    draftTimes: [toDateTimeLocalValueHK(new Date(Date.now() + 5 * 60 * 1000))],
     /** Race numbers (1-based) that receive new 預定 jobs on save — multi-select */
     targetRaceNos: [],
     /** Race number (1-based) shown in 預定抄賠率 results table — single select */
@@ -602,7 +649,7 @@ function scheduleTimeInputTemplate(time, index) {
   return `
     <div class="scheduleTimeRow">
       <label class="field">
-        <span class="fieldLabel">時間${index + 1}</span>
+        <span class="fieldLabel">時間${index + 1}（香港時間）</span>
         <input class="scheduleTimeInput" data-index="${index}" type="datetime-local" value="${escapeHtml(time)}" />
       </label>
       <button type="button" class="ghostBtn scheduleRemoveDraft" data-index="${index}" ${removeDisabled}>移除</button>
@@ -631,7 +678,7 @@ function scheduleJobsTemplate(jobs) {
       ${filtered.map((job) => `
         <div class="scheduleJobRow">
           <div>
-            <strong>${escapeHtml(formatDateTime(job.scheduled_at))}</strong>
+            <strong>${escapeHtml(formatDateTimeHK(job.scheduled_at))}</strong>
             <span class="statusPill status-${escapeHtml(job.status)}">${escapeHtml(statusLabel(job.status))}</span>
             ${job.last_error ? `<div class="jobError">${escapeHtml(job.last_error)}</div>` : ''}
           </div>
@@ -733,9 +780,9 @@ function scheduledResultTableForRace(raceNo) {
             ${horses.map((horse) => metaCell(horse, 'barrier', horse.barrier, 'numCell')).join('')}
           </tr>
           <tr class="sectionRow"><th scope="row" colspan="${horses.length + 1}">獨贏</th></tr>
-          ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHm(job.scheduled_at)})`, job, 'win')).join('')}
+          ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHmHK(job.scheduled_at)})`, job, 'win')).join('')}
           <tr class="sectionRow"><th scope="row" colspan="${horses.length + 1}">位置</th></tr>
-          ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHm(job.scheduled_at)})`, job, 'place')).join('')}
+          ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHmHK(job.scheduled_at)})`, job, 'place')).join('')}
         </tbody>
       </table>
     </div>
@@ -890,7 +937,12 @@ function applyMeetingSelectionFromDayList(list) {
 function syncHkjcWpLinkHref() {
   const f = readFilterQuiet()
   if (!f) return
-  const href = buildHkjcWpOddsUrl('ch', f.raceDate, f.meetingCode, f.raceNo)
+  let raceNo = f.raceNo
+  if (state.ui.bottomTab === 'scheduled') {
+    syncScheduledViewRaceForMeeting()
+    if (state.scheduled.viewRaceNo) raceNo = state.scheduled.viewRaceNo
+  }
+  const href = buildHkjcWpOddsUrl('ch', f.raceDate, f.meetingCode, raceNo)
   document.querySelectorAll('#linkHkjcWp, #linkHkjcWpScheduled').forEach((el) => {
     el.href = href
   })
@@ -907,6 +959,34 @@ function refreshLiveOddsTableQuiet() {
       const message = String(e?.message ?? e)
       showToast(`即時賠率自動更新失敗：${message}`)
     })
+}
+
+/** On entry: show cached odds, then refresh only the current race (not the whole card). */
+async function refreshAllLiveOddsOnEntry() {
+  if (!supabase) return
+  const raceDate = state.篩選.賽馬日
+  const meetingCode = state.篩選.會場代號
+  const raceNo = Number(state.篩選.場次編號)
+  if (!raceDate || !meetingCode || meetingRaceCap() < 1 || !Number.isFinite(raceNo) || raceNo < 1) return
+
+  const filter = { raceDate, meetingCode, raceNo: Math.trunc(raceNo) }
+  try {
+    await loadLatestResults(filter)
+    renderLiveOddsTable()
+  } catch {
+    // ignore — extract below may still succeed
+  }
+
+  showToast('正在更新即時賠率…')
+  try {
+    await runExtractNow(filter)
+    const n = await loadLatestResults(filter)
+    renderLiveOddsTable()
+    if (n) showToast(`已更新 ${n} 筆即時賠率`)
+    else showToast('暫未能取得即時賠率（可能尚未開盤）')
+  } catch {
+    showToast('暫未能取得即時賠率（可能尚未開盤）')
+  }
 }
 
 async function loadMeetingsForSelectedDate(options = {}) {
@@ -950,12 +1030,17 @@ async function refreshRaceSubtitle() {
     setRaceSubtitleText('請選擇賽馬日及場次')
     return
   }
+  let raceNo = f.raceNo
+  if (state.ui.bottomTab === 'scheduled') {
+    syncScheduledViewRaceForMeeting()
+    if (state.scheduled.viewRaceNo) raceNo = state.scheduled.viewRaceNo
+  }
   setRaceSubtitleText('載入中…')
   try {
-    const text = await fetchRaceSubtitle(f.raceDate, f.meetingCode, f.raceNo)
+    const text = await fetchRaceSubtitle(f.raceDate, f.meetingCode, raceNo)
     setRaceSubtitleText(text)
   } catch {
-    setRaceSubtitleText(`第${f.raceNo}場 · ${f.raceDate} · 會場 ${f.meetingCode}`)
+    setRaceSubtitleText(`第${raceNo}場 · ${f.raceDate} · 會場 ${f.meetingCode}`)
   }
 }
 
@@ -967,6 +1052,22 @@ function scheduleRefreshRaceSubtitle(delayMs = 0) {
       if (f) setRaceSubtitleText(`第${f.raceNo}場 · ${f.raceDate} · 會場 ${f.meetingCode}`)
     })
   }, delayMs)
+}
+
+/** PostgREST caps each response at 1000 rows; paginate for full meeting-day snapshot history. */
+async function fetchAllSupabaseRows(buildQuery, pageSize = 1000) {
+  const all = []
+  let from = 0
+  while (true) {
+    const to = from + pageSize - 1
+    const { data, error } = await buildQuery().range(from, to)
+    if (error) throw new Error(error.message)
+    const page = data ?? []
+    all.push(...page)
+    if (page.length < pageSize) break
+    from += pageSize
+  }
+  return all
 }
 
 async function loadLatestResults({ raceDate, meetingCode, raceNo }) {
@@ -1049,32 +1150,38 @@ async function loadScheduledData(force = false, { processDue = true } = {}) {
 
   state.scheduled.loading = true
   renderScheduledPanel()
-  const { data: jobs, error: jobsError } = await supabase
-    .from('race_extraction_jobs')
-    .select('id,race_date,meeting_code,race_no,scheduled_at,status,last_error,last_run_at,completed_at,created_at')
-    .eq('race_date', scope.raceDate)
-    .eq('meeting_code', scope.meetingCode)
-    .order('race_no', { ascending: true })
-    .order('scheduled_at', { ascending: true })
+  try {
+    const jobs = await fetchAllSupabaseRows(() =>
+      supabase
+        .from('race_extraction_jobs')
+        .select('id,race_date,meeting_code,race_no,scheduled_at,status,last_error,last_run_at,completed_at,created_at')
+        .eq('race_date', scope.raceDate)
+        .eq('meeting_code', scope.meetingCode)
+        .order('race_no', { ascending: true })
+        .order('scheduled_at', { ascending: true })
+    )
 
-  if (jobsError) throw new Error(jobsError.message)
+    const snapshots = await fetchAllSupabaseRows(() =>
+      supabase
+        .from('race_extraction_snapshots')
+        .select('job_id,race_no,horse_no,horse_name,barrier,jockey_name,trainer_name,win,place,withdrawn,extracted_at')
+        .eq('race_date', scope.raceDate)
+        .eq('meeting_code', scope.meetingCode)
+        .order('race_no', { ascending: true })
+        .order('horse_no', { ascending: true })
+        .order('extracted_at', { ascending: true })
+    )
 
-  const { data: snapshots, error: snapshotError } = await supabase
-    .from('race_extraction_snapshots')
-    .select('job_id,race_no,horse_no,horse_name,barrier,jockey_name,trainer_name,win,place,withdrawn,extracted_at')
-    .eq('race_date', scope.raceDate)
-    .eq('meeting_code', scope.meetingCode)
-    .order('race_no', { ascending: true })
-    .order('horse_no', { ascending: true })
-
-  if (snapshotError) throw new Error(snapshotError.message)
-
-  state.scheduled.jobs = jobs ?? []
-  state.scheduled.snapshots = snapshots ?? []
-  state.scheduled.loadedKey = key
-  syncScheduledViewRaceForMeeting()
-  state.scheduled.loading = false
-  renderScheduledPanel()
+    state.scheduled.jobs = jobs
+    state.scheduled.snapshots = snapshots
+    state.scheduled.loadedKey = key
+    syncScheduledViewRaceForMeeting()
+  } catch (e) {
+    showToast(String(e?.message ?? e))
+  } finally {
+    state.scheduled.loading = false
+    renderScheduledPanel()
+  }
 
   if (processDue && hasDuePendingJobs(state.scheduled.jobs)) {
     try {
@@ -1105,13 +1212,11 @@ async function saveScheduleTimes() {
   const rowsToInsert = []
   for (const raceNo of raceNos) {
     for (const time of uniqueTimes) {
-      const date = new Date(time)
-      if (Number.isNaN(date.getTime())) throw new Error('請填寫正確的預定時間')
       rowsToInsert.push({
         race_date: scope.raceDate,
         meeting_code: scope.meetingCode,
         race_no: raceNo,
-        scheduled_at: date.toISOString(),
+        scheduled_at: parseHKDateTimeLocalToISO(time),
         status: 'pending'
       })
     }
@@ -1119,7 +1224,7 @@ async function saveScheduleTimes() {
 
   const { error } = await supabase.from('race_extraction_jobs').insert(rowsToInsert)
   if (error) throw new Error(error.message)
-  state.scheduled.draftTimes = [toDateTimeLocalValue(new Date(Date.now() + 5 * 60 * 1000))]
+  state.scheduled.draftTimes = [toDateTimeLocalValueHK(new Date(Date.now() + 5 * 60 * 1000))]
   await loadScheduledData(true)
   return rowsToInsert.length
 }
@@ -1208,6 +1313,8 @@ function setBottomTab(which) {
     renderScheduleRacePickInDom()
     renderScheduleViewRacePickInDom()
     renderScheduleViewJobsRacePickInDom()
+    scheduleRefreshRaceSubtitle(0)
+    syncHkjcWpLinkHref()
   }
 }
 
@@ -1286,6 +1393,8 @@ function bindScheduleViewRacePickButtons() {
       } else if (supabase) {
         renderScheduledPanel()
       }
+      scheduleRefreshRaceSubtitle(0)
+      syncHkjcWpLinkHref()
     })
   })
 }
@@ -1363,9 +1472,15 @@ function syncHighlighterToggleLabels() {
 function bindScheduledEvents() {
   document.querySelector('#btnAddScheduleTime')?.addEventListener('click', () => {
     const last = state.scheduled.draftTimes.at(-1)
-    const base = last ? new Date(last) : new Date()
-    const next = Number.isNaN(base.getTime()) ? new Date(Date.now() + 5 * 60 * 1000) : new Date(base.getTime() + 5 * 60 * 1000)
-    state.scheduled.draftTimes.push(toDateTimeLocalValue(next))
+    let next
+    try {
+      next = last
+        ? new Date(new Date(parseHKDateTimeLocalToISO(last)).getTime() + 5 * 60 * 1000)
+        : new Date(Date.now() + 5 * 60 * 1000)
+    } catch {
+      next = new Date(Date.now() + 5 * 60 * 1000)
+    }
+    state.scheduled.draftTimes.push(toDateTimeLocalValueHK(next))
     renderScheduledPanel()
   })
 
@@ -1408,7 +1523,13 @@ function resetScheduledLoadedKey() {
 
 async function bootstrap() {
   restoreBottomTabFromStorage()
-  await loadMeetingsForSelectedDate()
+  mount()
+  try {
+    await loadMeetingsForSelectedDate()
+    await refreshAllLiveOddsOnEntry()
+  } catch (e) {
+    showToast(String(e?.message ?? e))
+  }
 }
 
 function statusLabel(status) {
@@ -1425,28 +1546,6 @@ function labelFromIndex(index) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
   if (index < alphabet.length) return alphabet[index]
   return String(index + 1)
-}
-
-function pad2(n) {
-  return String(n).padStart(2, '0')
-}
-
-function toDateTimeLocalValue(date) {
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`
-}
-
-function formatDateTime(value) {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return String(value)
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
-}
-
-function formatMonthDayHm(value) {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
-  return `${date.getMonth() + 1}月${date.getDate()} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
 function mount() {
@@ -1554,7 +1653,7 @@ function mount() {
   /** Re-apply tab visibility/pollers from state (handles restored 「預定」 tab after refresh). */
   setBottomTab(state.ui.bottomTab)
   if (state.ui.bottomTab === 'scheduled' && supabase) {
-    loadScheduledData().catch((e) => showToast(String(e?.message ?? e)))
+    loadScheduledData(true).catch((e) => showToast(String(e?.message ?? e)))
   }
 
   document.querySelector('#tabLiveBtn')?.addEventListener('click', () => {
@@ -1564,7 +1663,7 @@ function mount() {
   document.querySelector('#tabScheduledBtn')?.addEventListener('click', () => {
     if (state.ui.bottomTab === 'scheduled') return
     setBottomTab('scheduled')
-    loadScheduledData().catch((e) => showToast(String(e?.message ?? e)))
+    loadScheduledData(true).catch((e) => showToast(String(e?.message ?? e)))
   })
 
   document.querySelector('#btnRefresh')?.addEventListener('click', () => {

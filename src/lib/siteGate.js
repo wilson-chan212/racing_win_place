@@ -112,10 +112,17 @@ function showGate() {
 
 /** Run `startApp` only after site password gate (if VITE_SITE_PASSWORD is set). */
 export async function runWithSiteGate(startApp) {
-  if (!isSiteGateRequired() || isSiteUnlocked()) {
+  try {
+    if (!isSiteGateRequired() || isSiteUnlocked()) {
+      await startApp()
+      return
+    }
+    await showGate()
     await startApp()
-    return
+  } catch (e) {
+    const host = document.querySelector('#app')
+    if (!host) return
+    const msg = String(e?.message ?? e)
+    host.innerHTML = `<section class="siteGate" role="alert"><div class="siteGateCard"><p class="siteGateError">載入失敗：${escapeHtml(msg)}</p></div></section>`
   }
-  await showGate()
-  await startApp()
 }

@@ -336,6 +336,146 @@ export async function upsertRaceSnapshots(
   return data ?? []
 }
 
+export type DueJobResult = { id: string; ok: boolean; count?: number; error?: string }
+
+type ScheduledJob = {
+  id: string
+  created_by: string
+  race_date: string
+  meeting_code: string
+  race_no: number
+  scheduled_at: string | null
+}
+
+export function formatExtractionError(e: unknown): string {
+  if (e instanceof ExtractRaceError) {
+    return e.body.details ? `${e.body.error}: ${e.body.details}` : String(e.body.error ?? e.message)
+  }
+  return String(e instanceof Error ? e.message : e)
+}
+
+/** Jobs left in `running` after a timeout/crash are eligible to run again. */
+async function recoverStaleRunningJobs(
+  supabase: ReturnType<typeof createClient>,
+  staleMinutes = 10
+) {
+  const cutoff = new Date(Date.now() - staleMinutes * 60_000).toISOString()
+  await supabase
+    .from('race_extraction_jobs')
+    .update({
+      status: 'pending',
+      locked_at: null,
+      last_error: 'Previous run timed out; will retry',
+      updated_at: new Date().toISOString()
+    })
+    .eq('status', 'running')
+    .lt('locked_at', cutoff)
+}
+
+/** Process pending jobs whose scheduled_at has passed (browser or pg_cron). */
+export async function processDueExtractionJobs(
+  supabase: ReturnType<typeof createClient>,
+  options?: { batchSize?: number; maxBatches?: number }
+): Promise<{ ok: true; processed: number; results: DueJobResult[] }> {
+  const batchSize = options?.batchSize ?? 5
+  const maxBatches = options?.maxBatches ?? 4
+  const allResults: DueJobResult[] = []
+
+  await recoverStaleRunningJobs(supabase)
+
+  for (let batch = 0; batch < maxBatches; batch++) {
+    const nowIso = new Date().toISOString()
+    const { data: dueJobs, error: dueErr } = await supabase
+      .from('race_extraction_jobs')
+      .select('id,created_by,race_date,meeting_code,race_no,scheduled_at')
+      .eq('status', 'pending')
+      .lte('scheduled_at', nowIso)
+      .order('scheduled_at', { ascending: true })
+      .limit(batchSize)
+
+    if (dueErr) throw new ExtractRaceError({ error: 'Failed to load due jobs', details: dueErr.message }, 500)
+    if (!dueJobs?.length) break
+
+    for (const job of dueJobs as ScheduledJob[]) {
+      const lockTime = new Date().toISOString()
+      const { data: claimed, error: claimErr } = await supabase
+        .from('race_extraction_jobs')
+        .update({
+          status: 'running',
+          locked_at: lockTime,
+          last_run_at: lockTime,
+          attempt_count: 1
+        })
+        .eq('id', job.id)
+        .eq('status', 'pending')
+        .select('id,attempt_count')
+        .maybeSingle()
+
+      if (claimErr) {
+        allResults.push({ id: job.id, ok: false, error: claimErr.message })
+        continue
+      }
+      if (!claimed) continue
+
+      try {
+        const extractedAt = new Date().toISOString()
+        const extracted = await extractRaceOdds(job.race_date, job.meeting_code, job.race_no)
+        await upsertLatestRaceResults(supabase, {
+          createdBy: job.created_by,
+          raceDate: job.race_date,
+          meetingCode: job.meeting_code,
+          raceNo: job.race_no,
+          sourceUrl: extracted.sourceUrl,
+          rows: extracted.rows,
+          extractedAt
+        })
+        await upsertRaceSnapshots(supabase, {
+          jobId: job.id,
+          createdBy: job.created_by,
+          raceDate: job.race_date,
+          meetingCode: job.meeting_code,
+          raceNo: job.race_no,
+          sourceUrl: extracted.sourceUrl,
+          rows: extracted.rows,
+          extractedAt
+        })
+
+        const { error: doneErr } = await supabase
+          .from('race_extraction_jobs')
+          .update({
+            status: 'completed',
+            completed_at: extractedAt,
+            locked_at: null,
+            last_error: null,
+            updated_at: extractedAt
+          })
+          .eq('id', job.id)
+
+        if (doneErr) throw doneErr
+        allResults.push({ id: job.id, ok: true, count: extracted.rows.length })
+      } catch (e) {
+        const failedAt = new Date().toISOString()
+        const message = formatExtractionError(e).slice(0, 1000)
+        await supabase
+          .from('race_extraction_jobs')
+          .update({
+            status: 'failed',
+            locked_at: null,
+            last_error: message,
+            updated_at: failedAt
+          })
+          .eq('id', job.id)
+
+        allResults.push({ id: job.id, ok: false, error: message })
+      }
+    }
+
+    if (dueJobs.length < batchSize) break
+  }
+
+  return { ok: true, processed: allResults.length, results: allResults }
+}
+
 /** Must match HKJC's allowlisted operation shape (see horseOddsQuery in community hkjc-api). Extra top-level fields → WHITELIST_ERROR. */
 const HKJC_ODDS_QUERY = `
 query racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {
@@ -732,16 +872,22 @@ async function fetchGraphqlOdds(raceDate: string, meetingCode: string, raceNo: n
       byHorseNo.set(no, current)
       continue
     }
-    const w = toNumberOrNull(runner.winOdds)
-    if (w === null) continue
     const current = ensureRow(no)
-    if (current.win === null) current.win = w
+    const w = toNumberOrNull(runner.winOdds)
+    if (w !== null && current.win === null) current.win = w
     byHorseNo.set(no, current)
   }
 
   const rows = [...byHorseNo.values()].filter(
-    (r) => r.withdrawn || r.win !== null || r.place !== null
+    (r) =>
+      r.withdrawn ||
+      (r.horse_no != null && runnerDetails.has(r.horse_no)) ||
+      r.win !== null ||
+      r.place !== null
   )
+  const hasAnyOdds = rows.some((r) => !r.withdrawn && (r.win !== null || r.place !== null))
+  if (!hasAnyOdds) return []
+
   return rows.sort((a, b) => (a.horse_no ?? 0) - (b.horse_no ?? 0))
 }
 

@@ -7,8 +7,9 @@ const base = process.env.VITE_BASE || '/'
 export default defineConfig({
   base,
   server: {
-    host: '127.0.0.1',
+    host: true,
     port: 5501,
-    strictPort: true
+    strictPort: true,
+    open: true
   }
 })
