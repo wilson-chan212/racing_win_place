@@ -419,16 +419,8 @@ export async function processDueExtractionJobs(
 
       try {
         const extractedAt = new Date().toISOString()
+        // Always fetch fresh odds from HKJC at job time — never read or mirror race_results (即時賠率).
         const extracted = await extractRaceOdds(job.race_date, job.meeting_code, job.race_no)
-        await upsertLatestRaceResults(supabase, {
-          createdBy: job.created_by,
-          raceDate: job.race_date,
-          meetingCode: job.meeting_code,
-          raceNo: job.race_no,
-          sourceUrl: extracted.sourceUrl,
-          rows: extracted.rows,
-          extractedAt
-        })
         await upsertRaceSnapshots(supabase, {
           jobId: job.id,
           createdBy: job.created_by,

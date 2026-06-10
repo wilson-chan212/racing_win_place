@@ -63,21 +63,18 @@ HKJC URL 會依參數組合：
 
 ### 預定抄賠率排程
 
-App 會把使用者設定的預定時間寫入 `public.race_extraction_jobs`，processor 會把到期的工作寫入：
-- `public.race_results`：目前最新結果
-- `public.race_extraction_snapshots`：每個預定時間的歷史快照
+App 會把使用者設定的預定時間寫入 `public.race_extraction_jobs`。到期後由 **伺服器 pg_cron** 每分鐘呼叫 `process-user-due-extractions`（**無需開著網頁**），**直接向馬會提取**並只寫入：
+- `public.race_extraction_snapshots`：每個預定時間的歷史快照（與 `race_results` 即時賠率分開）
 
-在 Supabase Dashboard 建立 Cron / Scheduled Function，每分鐘 POST 到：
+**一次性設定（遠端 Supabase）：**
 
-```text
-https://<project-ref>.functions.supabase.co/process-scheduled-extractions
-```
+1. 執行 migration `008_schedule_processor_cron.sql`（`supabase db push` 或 SQL Editor）
+2. 在 SQL Editor 執行 `supabase/setup-cron-vault.sql`，填入你的 Project URL 與 anon key
+3. 部署 Edge Functions：`process-user-due-extractions`（及 `extract-race-results`）
 
-Header 需要包含：
+驗證 cron：`select jobid, jobname, schedule, active from cron.job where jobname = 'race-process-due-extractions';`
 
-```text
-x-schedule-secret: <SCHEDULE_PROCESSOR_SECRET>
-```
+（可選）外部 cron 亦可 POST `process-scheduled-extractions`，Header：`x-schedule-secret: <SCHEDULE_PROCESSOR_SECRET>`
 
 ## 4) Capacitor（Android / iOS）
 
