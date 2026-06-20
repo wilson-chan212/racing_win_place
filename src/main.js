@@ -1901,8 +1901,14 @@ function bindNoteCanvasEvents() {
   noteCanvasAbort?.abort()
   noteCanvasAbort = new AbortController()
 
+  const DRAW_SLOP_PX = 8
+  /** Finger drags that look like vertical scroll (not pen strokes) */
+  const SCROLL_VERTICAL_BIAS = 1.8
+
   let drawing = false
   let currentStroke = null
+  let pendingPointerId = null
+  let pendingStart = null
 
   const toPoint = (e) => {
     const rect = canvas.getBoundingClientRect()
@@ -1911,22 +1917,57 @@ function bindNoteCanvasEvents() {
     return { x: Math.max(0, x), y: Math.max(0, y) }
   }
 
-  const start = (e) => {
-    if (!state.ui.noteMode) return
-    if (e.button != null && e.button !== 0) return
+  const beginDrawing = (e, firstPoint) => {
     drawing = true
     currentStroke = {
       color: NOTE_COLORS.find((c) => c.id === state.ui.noteColor)?.css ?? '#ef4444',
       tool: state.ui.noteTool,
-      points: [toPoint(e)]
+      points: [firstPoint]
     }
     state.ui.noteStrokes.push(currentStroke)
     canvas.setPointerCapture?.(e.pointerId)
     e.preventDefault()
   }
 
+  const clearPending = () => {
+    pendingPointerId = null
+    pendingStart = null
+  }
+
+  const start = (e) => {
+    if (!state.ui.noteMode) return
+    if (e.button != null && e.button !== 0) return
+
+    if (e.pointerType === 'pen') {
+      clearPending()
+      beginDrawing(e, toPoint(e))
+      return
+    }
+
+    pendingPointerId = e.pointerId
+    pendingStart = { x: e.clientX, y: e.clientY }
+  }
+
   const move = (e) => {
-    if (!state.ui.noteMode || !drawing || !currentStroke) return
+    if (!state.ui.noteMode) return
+
+    if (pendingPointerId === e.pointerId && pendingStart && !drawing) {
+      const dx = e.clientX - pendingStart.x
+      const dy = e.clientY - pendingStart.y
+      const dist = Math.hypot(dx, dy)
+      if (dist < DRAW_SLOP_PX) return
+
+      if (Math.abs(dy) > Math.abs(dx) * SCROLL_VERTICAL_BIAS) {
+        clearPending()
+        return
+      }
+
+      beginDrawing(e, toPoint({ clientX: pendingStart.x, clientY: pendingStart.y }))
+      pendingPointerId = null
+      pendingStart = null
+    }
+
+    if (!drawing || !currentStroke) return
     currentStroke.points.push(toPoint(e))
 
     const ctx = canvas.getContext('2d')
@@ -1949,6 +1990,7 @@ function bindNoteCanvasEvents() {
   }
 
   const end = (e) => {
+    if (pendingPointerId === e.pointerId) clearPending()
     if (!drawing) return
     drawing = false
     currentStroke = null

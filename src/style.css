@@ -950,12 +950,12 @@ body.highlighterMode [data-highlight-key] {
   height: 100%;
   z-index: 5;
   pointer-events: none;
-  touch-action: none;
 }
 
 body.noteMode .noteCanvas.isEnabled {
   pointer-events: auto;
   cursor: crosshair;
+  touch-action: pan-y;
 }
 
 /* Keep footer controls clickable above note canvas */
