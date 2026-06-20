@@ -208,6 +208,11 @@ body {
   border-radius: 8px;
 }
 
+.scheduleRacePickBar .toggleHideCompletedJobsBtn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .controlsRowHkjcLink {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -537,6 +542,18 @@ select.controlSelect:disabled {
   gap: 10px;
 }
 
+/* Hide first (left-most) column toggle */
+.oddsTable.hideFirstCol thead th:first-child,
+.oddsTable.hideFirstCol tbody td:first-child {
+  display: none;
+}
+
+.scheduledTable.hideFirstCol thead th:first-child,
+.scheduledTable.hideFirstCol tbody th:first-child,
+.scheduledTable.hideFirstCol tbody td:first-child {
+  display: none;
+}
+
 .scheduledEmpty {
   padding: 14px 12px;
   color: var(--muted2);
@@ -594,6 +611,49 @@ select.controlSelect:disabled {
   color: var(--text);
 }
 
+.speedMapBlock {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #e3e8ef;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.speedMapHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.speedMapTitle {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text);
+}
+
+.speedMapSourceLink {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.speedMapSourceLink:hover {
+  text-decoration: underline;
+}
+
+.speedMapImage {
+  display: block;
+  width: 100%;
+  max-width: 1480px;
+  height: auto;
+  border-radius: 6px;
+  border: 1px solid #edf0f4;
+  background: #f8fafc;
+}
+
 .scheduleJobActions {
   display: flex;
   flex-direction: column;
@@ -649,7 +709,7 @@ select.controlSelect:disabled {
 }
 
 .scheduledTable {
-  min-width: 920px;
+  min-width: 600px;
   width: max-content;
   border-collapse: collapse;
   font-size: 12px;
@@ -657,8 +717,6 @@ select.controlSelect:disabled {
 
 .scheduledTable th,
 .scheduledTable td {
-  min-width: 64px;
-  max-width: 110px;
   padding: 7px 6px;
   border-right: 1px solid #dfe4ea;
   border-top: 1px solid #dfe4ea;
@@ -667,6 +725,12 @@ select.controlSelect:disabled {
   background: #fff;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.scheduledTable th:not(:first-child),
+.scheduledTable td:not(:first-child) {
+  min-width: 38px;
+  max-width: 66px;
 }
 
 .scheduledTable th:first-child,
@@ -695,13 +759,32 @@ select.controlSelect:disabled {
   background: #0b5f97;
 }
 
-.scheduledTable .sectionRow th {
-  position: static;
-  max-width: none;
-  text-align: left;
-  background: #e8eef4;
-  color: var(--text);
-  letter-spacing: 0.02em;
+.scheduledTable .cellOddsInput {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: inherit;
+  -moz-appearance: textfield;
+}
+
+.scheduledTable .cellOddsInput::-webkit-outer-spin-button,
+.scheduledTable .cellOddsInput::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.scheduledTable .cellOddsInput:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+  background: #fff;
 }
 
 .bottomNav {
@@ -836,12 +919,161 @@ select.controlSelect:disabled {
 .oddsTable td.isHighlighted,
 .scheduledTable th.isHighlighted,
 .scheduledTable td.isHighlighted {
-  background-color: #fff9b8 !important;
   color: var(--text);
+}
+
+.isHighlighted.hl-yellow {
+  background-color: #fff59a !important;
+}
+
+.isHighlighted.hl-pink {
+  background-color: #ffd1e8 !important;
+}
+
+.isHighlighted.hl-green {
+  background-color: #c8f7c5 !important;
 }
 
 body.highlighterMode [data-highlight-key] {
   cursor: pointer;
+}
+
+/* Notes: freehand red pen on 預定抄賠率 */
+.noteHost {
+  position: relative;
+}
+
+.noteCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 5;
+  pointer-events: none;
+  touch-action: none;
+}
+
+body.noteMode .noteCanvas.isEnabled {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+/* Keep footer controls clickable above note canvas */
+body.noteMode .scheduledFooterBar,
+body.noteMode .scheduledHkjcRow {
+  position: relative;
+  z-index: 15;
+}
+
+.toggleEraserBtn.isActive {
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.08);
+  opacity: 1;
+}
+
+.noteToolGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.noteColorRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  max-width: 0;
+  opacity: 0;
+  transition: max-width 0.22s ease, opacity 0.18s ease;
+}
+
+.noteToolGroup.isOpen .noteColorRow {
+  max-width: 7.5rem;
+  opacity: 1;
+}
+
+.noteColorBtn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #fff;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0.92;
+}
+
+.noteColorBtn:active {
+  transform: scale(0.96);
+}
+
+.noteColorBtn.isActive {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(11, 103, 164, 0.12);
+}
+
+.noteSwatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: var(--swatch, #ef4444);
+  border: 1px solid rgba(15, 23, 42, 0.16);
+}
+
+.hlToolGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.hlColorRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  max-width: 0;
+  opacity: 0;
+  transition: max-width 0.22s ease, opacity 0.18s ease;
+}
+
+.hlToolGroup.isOpen .hlColorRow {
+  max-width: 7.5rem;
+  opacity: 1;
+}
+
+.hlColorBtn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #fff;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0.92;
+}
+
+.hlColorBtn:active {
+  transform: scale(0.96);
+}
+
+.hlColorBtn.isActive {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(11, 103, 164, 0.12);
+}
+
+.hlSwatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: var(--swatch, #fff59a);
+  border: 1px solid rgba(15, 23, 42, 0.16);
 }
 
 .snackbar {

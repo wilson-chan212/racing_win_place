@@ -47,6 +47,10 @@ Edge Function 需要環境變數（Supabase CLI 不允許 `SUPABASE_*` 開頭，
 - `PROJECT_SERVICE_ROLE_KEY`
 - `PROJECT_SUPABASE_ANON_KEY`（用來辨識匿名使用者）
 - `SCHEDULE_PROCESSOR_SECRET`（只供排程 processor 使用）
+- `SCREENSHOT_API_KEY`（走位圖截圖；例如 [Browserless](https://www.browserless.io/) API token）
+- `SCREENSHOT_API_URL`（可選；預設 `https://production-sfo.browserless.io/chromium/screenshot`）
+
+走位圖截取前會用 HKJC GraphQL 確認該賽馬日／會場／場次存在；截圖時再驗證 SpeedPRO 頁面嘅賽馬日、會場（沙田／跑馬地）同走位圖內容，驗證失敗唔會儲存圖片（賠率提取不受影響）。
 
 呼叫格式（App 會用 `supabase.functions.invoke` 呼叫）：
 

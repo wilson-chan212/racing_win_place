@@ -6,6 +6,7 @@ import {
   createServiceSupabase,
   corsHeaders,
   ExtractRaceError,
+  ensureSpeedMapCaptured,
   extractRaceOdds,
   isISODate,
   json,
@@ -53,6 +54,17 @@ Deno.serve(async (req) => {
       sourceUrl: extracted.sourceUrl,
       rows: extracted.rows
     })
+
+    try {
+      await ensureSpeedMapCaptured(supabase, {
+        createdBy: userId,
+        raceDate,
+        meetingCode,
+        raceNo
+      })
+    } catch (speedMapErr) {
+      console.error('Speed map capture failed:', String(speedMapErr))
+    }
 
     return json({
       ok: true,

@@ -83,8 +83,22 @@ const state = {
     meetingsLoading: false,
     /** Hide withdrawn (退出) horses in 即時賠率 + 預定抄賠率 results table */
     hideWithdrawnHorses: false,
+    /** Hide the first (left-most) column in tables */
+    hideFirstColumn: false,
+    /** Hide finished 預約提取 rows (completed / failed / cancelled) */
+    hideCompletedJobs: false,
     /** Tap table cells to apply fixed light-yellow highlight */
-    highlighterMode: false
+    highlighterMode: false,
+    /** Current highlight color id */
+    highlighterColor: 'yellow',
+    /** Freehand drawing on 預定抄賠率 panel */
+    noteMode: false,
+    /** Current note pen color id */
+    noteColor: 'red',
+    /** 'pen' | 'eraser' */
+    noteTool: 'pen',
+    /** Array of strokes, each stroke = [{x,y}, ...] in CSS px relative to canvas */
+    noteStrokes: []
   },
   scheduled: {
     draftTimes: [toDateTimeLocalValueHK(new Date(Date.now() + 5 * 60 * 1000))],
@@ -96,6 +110,10 @@ const state = {
     viewJobsRaceNo: null,
     jobs: [],
     snapshots: [],
+    /** Per-race metadata (e.g. speed map URL) for current meeting day */
+    raceMetadata: [],
+    /** User-entered win/place odds per horse — keys from manualOddsKey() */
+    manualOdds: {},
     loading: false,
     loadedKey: ''
   }
@@ -105,37 +123,125 @@ let rows = []
 let scheduleDuePollTimer = null
 let hideWithdrawnClickDelegationAbort = null
 let highlighterClickDelegationAbort = null
+let noteCanvasAbort = null
 
 const HIGHLIGHT_STORAGE_KEY = 'projectRace_cellHighlights'
+const HIGHLIGHT_COLOR_STORAGE_KEY = 'projectRace_highlighterColor'
 /** Remember 即時／預定 tab so reload keeps the same Supabase-backed view. */
 const BOTTOM_TAB_STORAGE_KEY = 'projectRace_bottomTab'
+const HIDE_FIRST_COL_STORAGE_KEY = 'projectRace_hideFirstColumn'
+const HIDE_COMPLETED_JOBS_STORAGE_KEY = 'projectRace_hideCompletedJobs'
+const MANUAL_ODDS_STORAGE_KEY = 'projectRace_manualOdds'
 
-function getHighlightedKeys() {
-  if (!getHighlightedKeys._cache) {
-    try {
-      const raw = localStorage.getItem(HIGHLIGHT_STORAGE_KEY)
-      const arr = raw ? JSON.parse(raw) : []
-      getHighlightedKeys._cache = new Set(Array.isArray(arr) ? arr.filter((k) => typeof k === 'string') : [])
-    } catch {
-      getHighlightedKeys._cache = new Set()
-    }
+const HIGHLIGHT_COLORS = [
+  { id: 'yellow', label: '黃', css: '#fff59a' },
+  { id: 'pink', label: '粉紅', css: '#ffd1e8' },
+  { id: 'green', label: '綠', css: '#c8f7c5' }
+]
+
+const NOTE_COLORS = [
+  { id: 'red', label: '紅', css: '#ef4444' },
+  { id: 'blue', label: '藍', css: '#2563eb' },
+  { id: 'purple', label: '紫', css: '#7c3aed' }
+]
+
+function persistHideFirstColumn() {
+  try {
+    localStorage.setItem(HIDE_FIRST_COL_STORAGE_KEY, state.ui.hideFirstColumn ? '1' : '0')
+  } catch {
+    // ignore quota / privacy mode
   }
-  return getHighlightedKeys._cache
 }
 
-function persistHighlightedKeys() {
-  localStorage.setItem(HIGHLIGHT_STORAGE_KEY, JSON.stringify([...getHighlightedKeys()]))
+function restoreHideFirstColumnFromStorage() {
+  try {
+    const v = localStorage.getItem(HIDE_FIRST_COL_STORAGE_KEY)
+    state.ui.hideFirstColumn = v === '1'
+  } catch {
+    /* ignore */
+  }
+}
+
+function persistHideCompletedJobs() {
+  try {
+    localStorage.setItem(HIDE_COMPLETED_JOBS_STORAGE_KEY, state.ui.hideCompletedJobs ? '1' : '0')
+  } catch {
+    // ignore quota / privacy mode
+  }
+}
+
+function restoreHideCompletedJobsFromStorage() {
+  try {
+    const v = localStorage.getItem(HIDE_COMPLETED_JOBS_STORAGE_KEY)
+    state.ui.hideCompletedJobs = v === '1'
+  } catch {
+    /* ignore */
+  }
+}
+
+function getHighlightsByKey() {
+  if (!getHighlightsByKey._cache) {
+    try {
+      const raw = localStorage.getItem(HIGHLIGHT_STORAGE_KEY)
+      const parsed = raw ? JSON.parse(raw) : null
+
+      // Back-compat: v1 stored as string[]
+      if (Array.isArray(parsed)) {
+        const obj = Object.create(null)
+        for (const k of parsed) {
+          if (typeof k === 'string' && k) obj[k] = 'yellow'
+        }
+        getHighlightsByKey._cache = obj
+        localStorage.setItem(HIGHLIGHT_STORAGE_KEY, JSON.stringify(obj))
+      } else if (parsed && typeof parsed === 'object') {
+        const obj = Object.create(null)
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof k !== 'string' || !k) continue
+          if (typeof v !== 'string' || !HIGHLIGHT_COLORS.some((c) => c.id === v)) continue
+          obj[k] = v
+        }
+        getHighlightsByKey._cache = obj
+      } else {
+        getHighlightsByKey._cache = Object.create(null)
+      }
+    } catch {
+      getHighlightsByKey._cache = Object.create(null)
+    }
+  }
+  return getHighlightsByKey._cache
+}
+
+function persistHighlightsByKey() {
+  localStorage.setItem(HIGHLIGHT_STORAGE_KEY, JSON.stringify(getHighlightsByKey()))
+}
+
+function getCellHighlightColor(key) {
+  return getHighlightsByKey()[key] ?? null
 }
 
 function isCellHighlighted(key) {
-  return getHighlightedKeys().has(key)
+  return Boolean(getCellHighlightColor(key))
 }
 
-function toggleCellHighlight(key) {
-  const set = getHighlightedKeys()
-  if (set.has(key)) set.delete(key)
-  else set.add(key)
-  persistHighlightedKeys()
+function setCellHighlight(key, colorId) {
+  if (!key) return
+  const ok = HIGHLIGHT_COLORS.some((c) => c.id === colorId)
+  if (!ok) return
+  getHighlightsByKey()[key] = colorId
+  persistHighlightsByKey()
+}
+
+function removeCellHighlight(key) {
+  const map = getHighlightsByKey()
+  if (map[key] == null) return
+  delete map[key]
+  persistHighlightsByKey()
+}
+
+function toggleCellHighlight(key, colorId) {
+  const cur = getCellHighlightColor(key)
+  if (cur && cur === colorId) removeCellHighlight(key)
+  else setCellHighlight(key, colorId)
 }
 
 function liveHighlightKey(horseNo, column) {
@@ -158,8 +264,50 @@ function scheduledOddsHighlightKey(raceNo, jobId, horseNo, field) {
   return `sch|${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}|odds|${jobId}|${horseNo}|${field}`
 }
 
+function scheduledManualOddsHighlightKey(raceNo, horseNo, field) {
+  return `sch|${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}|manual|${horseNo}|${field}`
+}
+
+function manualOddsKey(raceNo, horseNo, field) {
+  return `${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}|${horseNo}|${field}`
+}
+
+function getManualOddsValue(raceNo, horseNo, field) {
+  return state.scheduled.manualOdds[manualOddsKey(raceNo, horseNo, field)] ?? ''
+}
+
+function setManualOddsValue(raceNo, horseNo, field, value) {
+  const key = manualOddsKey(raceNo, horseNo, field)
+  const trimmed = String(value ?? '').trim()
+  if (trimmed) state.scheduled.manualOdds[key] = trimmed
+  else delete state.scheduled.manualOdds[key]
+  persistManualOdds()
+}
+
+function persistManualOdds() {
+  try {
+    localStorage.setItem(MANUAL_ODDS_STORAGE_KEY, JSON.stringify(state.scheduled.manualOdds))
+  } catch {
+    // ignore quota / privacy mode
+  }
+}
+
+function restoreManualOddsFromStorage() {
+  try {
+    const raw = localStorage.getItem(MANUAL_ODDS_STORAGE_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      state.scheduled.manualOdds = parsed
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function highlightCellClassSuffix(key) {
-  return isCellHighlighted(key) ? ' isHighlighted' : ''
+  const color = getCellHighlightColor(key)
+  return color ? ` isHighlighted hl-${color}` : ''
 }
 
 function highlightDataAttr(key) {
@@ -244,13 +392,75 @@ function hideWithdrawnToggleButtonHtml() {
   return `<button type="button" class="ghostBtn toggleHideWithdrawnBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '顯示退出馬匹' : '隱藏退出馬匹'}</button>`
 }
 
-function highlighterToggleButtonHtml() {
+function hideFirstColumnToggleButtonHtml() {
+  const on = state.ui.hideFirstColumn
+  return `<button type="button" class="ghostBtn toggleHideFirstColBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '顯示左欄' : '隱藏左欄'}</button>`
+}
+
+function hideCompletedJobsToggleButtonHtml() {
+  const on = state.ui.hideCompletedJobs
+  return `<button type="button" class="ghostBtn toggleHideCompletedJobsBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '顯示已完成項目' : '隱藏已完成項目'}</button>`
+}
+
+function isFinishedScheduleJob(job) {
+  return ['completed', 'failed', 'cancelled'].includes(job.status)
+}
+
+function highlighterToolHtml() {
   const on = state.ui.highlighterMode
-  return `<button type="button" class="ghostBtn toggleHighlighterBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '關閉熒光筆' : '熒光筆'}</button>`
+  const cur = state.ui.highlighterColor
+  return `
+    <div class="hlToolGroup${on ? ' isOpen' : ''}">
+      <button type="button" class="ghostBtn toggleHighlighterBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '關閉熒光筆' : '熒光筆'}</button>
+      <div class="hlColorRow" role="radiogroup" aria-label="熒光筆顏色" aria-hidden="${on ? 'false' : 'true'}">
+        ${HIGHLIGHT_COLORS.map((c) => {
+          const active = c.id === cur ? ' isActive' : ''
+          return `<button type="button" class="hlColorBtn${active}" data-hl-color="${escapeHtml(c.id)}" aria-pressed="${c.id === cur ? 'true' : 'false'}" title="${escapeHtml(c.label)}" tabindex="${on ? '0' : '-1'}">
+            <span class="hlSwatch" style="--swatch:${escapeHtml(c.css)}"></span>
+          </button>`
+        }).join('')}
+      </div>
+    </div>
+  `
+}
+
+function noteToolHtml() {
+  const on = state.ui.noteMode
+  const cur = state.ui.noteColor
+  return `
+    <div class="noteToolGroup${on ? ' isOpen' : ''}">
+      <button type="button" class="ghostBtn toggleNoteBtn" aria-pressed="${on ? 'true' : 'false'}">${on ? '關閉筆記' : '筆記'}</button>
+      <div class="noteColorRow" role="radiogroup" aria-label="筆記顏色" aria-hidden="${on ? 'false' : 'true'}">
+        ${NOTE_COLORS.map((c) => {
+          const active = c.id === cur ? ' isActive' : ''
+          return `<button type="button" class="noteColorBtn${active}" data-note-color="${escapeHtml(c.id)}" aria-pressed="${c.id === cur ? 'true' : 'false'}" title="${escapeHtml(c.label)}" tabindex="${on ? '0' : '-1'}">
+            <span class="noteSwatch" style="--swatch:${escapeHtml(c.css)}"></span>
+          </button>`
+        }).join('')}
+      </div>
+    </div>
+  `
+}
+
+function noteClearButtonHtml() {
+  const on = state.ui.noteMode
+  const hidden = on ? '' : ' hidden aria-hidden="true"'
+  return `<button type="button" class="ghostBtn clearNoteBtn"${hidden}>清除筆記</button>`
+}
+
+function noteEraserToggleButtonHtml() {
+  const on = state.ui.noteMode
+  const isEraser = state.ui.noteTool === 'eraser'
+  const hidden = on ? '' : ' hidden aria-hidden="true"'
+  return `<button type="button" class="ghostBtn toggleEraserBtn${isEraser ? ' isActive' : ''}" aria-pressed="${isEraser ? 'true' : 'false'}"${hidden}>橡皮擦</button>`
 }
 
 function hkjcWpAndHideRowFragment(linkId) {
   const href = buildHkjcWpOddsUrl('ch', state.篩選.賽馬日, state.篩選.會場代號, state.篩選.場次編號)
+  const noteControls =
+    state.ui.bottomTab === 'scheduled'
+      ? `${noteToolHtml()}${noteClearButtonHtml()}${noteEraserToggleButtonHtml()}`
+      : ''
   return `
         <a
           id="${linkId}"
@@ -259,7 +469,9 @@ function hkjcWpAndHideRowFragment(linkId) {
           target="_blank"
           rel="noopener noreferrer"
         >開啟馬會投注頁（對應目前選項）</a>
-        ${highlighterToggleButtonHtml()}
+        ${noteControls}
+        ${highlighterToolHtml()}
+        ${hideFirstColumnToggleButtonHtml()}
         ${hideWithdrawnToggleButtonHtml()}
   `
 }
@@ -411,6 +623,7 @@ function scheduledViewJobsRacePickSection() {
       <div class="scheduledViewJobsRaceBlock scheduleRacePickBar">
         <span class="schedulePickBarLabel">檢視場次（預約提取）</span>
         <div id="scheduleViewJobsRacePickHost" class="scheduleRacePickRowWrap">${scheduleViewJobsRacePickTemplate()}</div>
+        ${hideCompletedJobsToggleButtonHtml()}
       </div>`
 }
 
@@ -454,6 +667,7 @@ function renderScheduleViewJobsRacePickInDom() {
   syncScheduledViewJobsRaceForMeeting()
   host.innerHTML = scheduleViewJobsRacePickTemplate()
   bindScheduleViewJobsRacePickButtons()
+  if (typeof redrawNoteCanvas === 'function') redrawNoteCanvas()
 }
 
 function renderScheduleJobsListInDom() {
@@ -461,6 +675,7 @@ function renderScheduleJobsListInDom() {
   if (!host) return
   host.innerHTML = scheduleJobsTemplate(state.scheduled.jobs)
   bindScheduleJobListActions()
+  if (typeof redrawNoteCanvas === 'function') redrawNoteCanvas()
 }
 
 function visibleLiveRows() {
@@ -615,7 +830,7 @@ function scheduledTemplate() {
   const completedCount = jobs.filter((job) => job.status === 'completed').length
 
   return `
-    <section class="scheduledPanel" aria-label="預定抄賠率">
+    <section class="scheduledPanel noteHost" aria-label="預定抄賠率">
       <div class="scheduledCard">
         <div class="scheduleActions">
           <button type="button" class="ghostBtn" id="btnAddScheduleTime">新增時間</button>
@@ -640,6 +855,7 @@ function scheduledTemplate() {
       <div id="scheduleJobsHost">${scheduleJobsTemplate(jobs)}</div>
       ${scheduledViewRacePickSection()}
       <div id="scheduledResultsHost">${scheduledResultTableTemplate()}</div>
+      <canvas id="noteCanvas" class="noteCanvas" aria-hidden="true"></canvas>
     </section>
   `
 }
@@ -668,9 +884,16 @@ function scheduleJobsTemplate(jobs) {
     if (meetingRaceCap() < 1) return ''
     return `<div class="scheduledEmpty">請選擇要檢視的場次。</div>`
   }
-  const filtered = jobs.filter((job) => job.race_no === raceNo)
-  if (!filtered.length) {
+  const raceJobs = jobs.filter((job) => job.race_no === raceNo)
+  if (!raceJobs.length) {
     return `<div class="scheduledEmpty">第${raceNo}場尚無預定提取。</div>`
+  }
+
+  const filtered = state.ui.hideCompletedJobs
+    ? raceJobs.filter((job) => !isFinishedScheduleJob(job))
+    : raceJobs
+  if (!filtered.length) {
+    return `<div class="scheduledEmpty">第${raceNo}場嘅已完成項目已隱藏。</div>`
   }
 
   return `
@@ -688,6 +911,30 @@ function scheduleJobsTemplate(jobs) {
           </div>
         </div>
       `).join('')}
+    </div>
+  `
+}
+
+function speedMapSectionForRace(raceNo) {
+  const meta = state.scheduled.raceMetadata.find((row) => row.race_no === raceNo)
+  if (!meta?.speed_map_url) return ''
+
+  return `
+    <div class="speedMapBlock" aria-label="第${raceNo}場走位圖">
+      <div class="speedMapHeader">
+        <h4 class="speedMapTitle">走位圖</h4>
+        ${
+          meta.speed_map_source_url
+            ? `<a class="speedMapSourceLink" href="${escapeHtml(meta.speed_map_source_url)}" target="_blank" rel="noopener noreferrer">馬會來源</a>`
+            : ''
+        }
+      </div>
+      <img
+        class="speedMapImage"
+        src="${escapeHtml(meta.speed_map_url)}"
+        alt="第${raceNo}場走位圖"
+        loading="lazy"
+      />
     </div>
   `
 }
@@ -743,11 +990,41 @@ function scheduledResultTableForRace(raceNo) {
     </tr>
   `
 
+  const manualOddsRow = (label, field) => `
+    <tr>
+      <th scope="row">${escapeHtml(label)}</th>
+      ${horses
+        .map((horse) => {
+          const key = scheduledManualOddsHighlightKey(raceNo, horse.horse_no, field)
+          if (horse.withdrawn) {
+            return highlightTd('oddCell isWithdrawn', key, '退出')
+          }
+          const value = getManualOddsValue(raceNo, horse.horse_no, field)
+          const inputClass = 'cellOddsInput'
+          const inputAttrs = [
+            `class="${inputClass}"`,
+            'type="number"',
+            'inputmode="decimal"',
+            'step="any"',
+            'min="0"',
+            `data-race-no="${raceNo}"`,
+            `data-horse-no="${horse.horse_no}"`,
+            `data-field="${field}"`,
+            `value="${escapeHtml(value)}"`,
+            `aria-label="${escapeHtml(`${label} 馬${horse.horse_no}`)}"`
+          ].join(' ')
+          return `<td class="oddCell${highlightCellClassSuffix(key)}"${highlightDataAttr(key)}><input ${inputAttrs} /></td>`
+        })
+        .join('')}
+    </tr>
+  `
+
   return `
     <div class="scheduledTableBlock">
       <h3 class="scheduledTableRaceTitle">第${raceNo}場</h3>
+      ${speedMapSectionForRace(raceNo)}
       <div class="scheduledTableWrap" role="region" aria-label="預定抄賠率結果 第${raceNo}場">
-      <table class="scheduledTable">
+      <table class="scheduledTable${state.ui.hideFirstColumn ? ' hideFirstCol' : ''}">
         <thead>
           <tr>
             <th>馬號</th>
@@ -779,9 +1056,9 @@ function scheduledResultTableForRace(raceNo) {
             <th scope="row">檔位</th>
             ${horses.map((horse) => metaCell(horse, 'barrier', horse.barrier, 'numCell')).join('')}
           </tr>
-          <tr class="sectionRow"><th scope="row" colspan="${horses.length + 1}">獨贏</th></tr>
+          ${manualOddsRow('獨贏', 'win')}
           ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHmHK(job.scheduled_at)})`, job, 'win')).join('')}
-          <tr class="sectionRow"><th scope="row" colspan="${horses.length + 1}">位置</th></tr>
+          ${manualOddsRow('位置', 'place')}
           ${completedJobs.map((job, index) => oddsRow(`時間${labelFromIndex(index)}(${formatMonthDayHmHK(job.scheduled_at)})`, job, 'place')).join('')}
         </tbody>
       </table>
@@ -862,6 +1139,8 @@ function renderLiveOddsTableBody() {
 function renderLiveOddsTable() {
   renderLiveOddsTableHead()
   renderLiveOddsTableBody()
+  const tbl = document.querySelector('#panelLive .oddsTable')
+  if (tbl) tbl.classList.toggle('hideFirstCol', state.ui.hideFirstColumn)
 }
 
 function showToast(msg) {
@@ -1172,8 +1451,18 @@ async function loadScheduledData(force = false, { processDue = true } = {}) {
         .order('extracted_at', { ascending: true })
     )
 
+    const raceMetadata = await fetchAllSupabaseRows(() =>
+      supabase
+        .from('race_metadata')
+        .select('race_no,speed_map_url,speed_map_source_url,captured_at')
+        .eq('race_date', scope.raceDate)
+        .eq('meeting_code', scope.meetingCode)
+        .order('race_no', { ascending: true })
+    )
+
     state.scheduled.jobs = jobs
     state.scheduled.snapshots = snapshots
+    state.scheduled.raceMetadata = raceMetadata
     state.scheduled.loadedKey = key
     syncScheduledViewRaceForMeeting()
   } catch (e) {
@@ -1345,6 +1634,8 @@ function renderScheduledPanel() {
   syncHkjcWpLinkHref()
   syncHideWithdrawnToggleLabels()
   syncHighlighterToggleLabels()
+  syncNoteModeDom()
+  bindNoteCanvasEvents()
 }
 
 function updateScheduleRacePickButtonsInDom() {
@@ -1442,6 +1733,14 @@ function toggleHideWithdrawnHorses() {
   syncHideWithdrawnToggleLabels()
 }
 
+function syncHideCompletedJobsToggleLabels() {
+  const on = state.ui.hideCompletedJobs
+  document.querySelectorAll('.toggleHideCompletedJobsBtn').forEach((btn) => {
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false')
+    btn.textContent = on ? '顯示已完成項目' : '隱藏已完成項目'
+  })
+}
+
 function syncHideWithdrawnToggleLabels() {
   const on = state.ui.hideWithdrawnHorses
   document.querySelectorAll('.toggleHideWithdrawnBtn').forEach((btn) => {
@@ -1453,6 +1752,7 @@ function syncHideWithdrawnToggleLabels() {
 function syncHighlighterModeDom() {
   document.body.classList.toggle('highlighterMode', state.ui.highlighterMode)
   syncHighlighterToggleLabels()
+  syncHighlighterColorPicker()
 }
 
 function toggleHighlighterMode() {
@@ -1461,11 +1761,251 @@ function toggleHighlighterMode() {
   showToast(state.ui.highlighterMode ? '熒光筆已開啟：點選表格格以標示' : '熒光筆已關閉')
 }
 
+function syncNoteModeDom() {
+  document.body.classList.toggle('noteMode', state.ui.noteMode)
+  document.querySelectorAll('.noteToolGroup').forEach((group) => {
+    group.classList.toggle('isOpen', state.ui.noteMode)
+  })
+  document.querySelectorAll('.toggleNoteBtn').forEach((btn) => {
+    btn.setAttribute('aria-pressed', state.ui.noteMode ? 'true' : 'false')
+    btn.textContent = state.ui.noteMode ? '關閉筆記' : '筆記'
+  })
+  document.querySelectorAll('.clearNoteBtn').forEach((btn) => {
+    if (state.ui.noteMode) {
+      btn.removeAttribute('hidden')
+      btn.removeAttribute('aria-hidden')
+    } else {
+      btn.setAttribute('hidden', '')
+      btn.setAttribute('aria-hidden', 'true')
+    }
+  })
+  document.querySelectorAll('.noteColorRow').forEach((row) => {
+    row.setAttribute('aria-hidden', state.ui.noteMode ? 'false' : 'true')
+  })
+  document.querySelectorAll('.noteColorBtn').forEach((btn) => {
+    const id = btn.dataset.noteColor
+    const isOn = id === state.ui.noteColor
+    btn.classList.toggle('isActive', isOn)
+    btn.setAttribute('aria-pressed', isOn ? 'true' : 'false')
+    btn.tabIndex = state.ui.noteMode ? 0 : -1
+  })
+  document.querySelectorAll('.toggleEraserBtn').forEach((btn) => {
+    if (state.ui.noteMode) {
+      btn.removeAttribute('hidden')
+      btn.removeAttribute('aria-hidden')
+    } else {
+      btn.setAttribute('hidden', '')
+      btn.setAttribute('aria-hidden', 'true')
+    }
+    const isEraser = state.ui.noteTool === 'eraser'
+    btn.classList.toggle('isActive', isEraser)
+    btn.setAttribute('aria-pressed', isEraser ? 'true' : 'false')
+  })
+  syncNoteCanvasInteractivity()
+}
+
+function toggleNoteMode() {
+  state.ui.noteMode = !state.ui.noteMode
+  if (!state.ui.noteMode) state.ui.noteTool = 'pen'
+  syncNoteModeDom()
+  showToast(state.ui.noteMode ? '筆記已開啟：用紅筆喺頁面寫低重點' : '筆記已關閉')
+}
+
+function toggleEraser() {
+  state.ui.noteTool = state.ui.noteTool === 'eraser' ? 'pen' : 'eraser'
+  syncNoteModeDom()
+  showToast(state.ui.noteTool === 'eraser' ? '橡皮擦：喺畫面上擦走筆記' : '已切換返畫筆')
+}
+
+function clearNote() {
+  state.ui.noteStrokes = []
+  redrawNoteCanvas()
+  showToast('已清除筆記')
+}
+
+function getNoteCanvas() {
+  return document.querySelector('#noteCanvas')
+}
+
+function resizeNoteCanvasToHost() {
+  const canvas = getNoteCanvas()
+  if (!canvas) return
+  const host = canvas.closest('.noteHost')
+  if (!host) return
+
+  const cssW = Math.max(1, Math.round(host.clientWidth))
+  const cssH = Math.max(1, Math.round(host.scrollHeight))
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1))
+
+  canvas.style.width = `${cssW}px`
+  canvas.style.height = `${cssH}px`
+
+  const pxW = Math.max(1, Math.round(cssW * dpr))
+  const pxH = Math.max(1, Math.round(cssH * dpr))
+  if (canvas.width !== pxW) canvas.width = pxW
+  if (canvas.height !== pxH) canvas.height = pxH
+
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+}
+
+function redrawNoteCanvas() {
+  const canvas = getNoteCanvas()
+  if (!canvas) return
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+
+  resizeNoteCanvasToHost()
+
+  const w = canvas.clientWidth
+  const h = canvas.clientHeight
+  ctx.clearRect(0, 0, w, h)
+
+  ctx.lineWidth = 2
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+
+  for (const stroke of state.ui.noteStrokes) {
+    // Back-compat: old shape was points[]
+    const points = Array.isArray(stroke) ? stroke : stroke?.points
+    const color = Array.isArray(stroke) ? '#ef4444' : (stroke?.color || '#ef4444')
+    const tool = Array.isArray(stroke) ? 'pen' : (stroke?.tool || 'pen')
+    if (!Array.isArray(points) || points.length < 2) continue
+    ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'
+    ctx.strokeStyle = color
+    ctx.lineWidth = tool === 'eraser' ? 14 : 2
+    ctx.beginPath()
+    ctx.moveTo(points[0].x, points[0].y)
+    for (let i = 1; i < points.length; i++) {
+      const p = points[i]
+      if (!p) continue
+      ctx.lineTo(p.x, p.y)
+    }
+    ctx.stroke()
+  }
+}
+
+function syncNoteCanvasInteractivity() {
+  const canvas = getNoteCanvas()
+  if (!canvas) return
+  canvas.classList.toggle('isEnabled', state.ui.noteMode)
+  canvas.setAttribute('aria-hidden', state.ui.noteMode ? 'false' : 'true')
+  redrawNoteCanvas()
+}
+
+function bindNoteCanvasEvents() {
+  const canvas = getNoteCanvas()
+  if (!canvas) return
+
+  noteCanvasAbort?.abort()
+  noteCanvasAbort = new AbortController()
+
+  let drawing = false
+  let currentStroke = null
+
+  const toPoint = (e) => {
+    const rect = canvas.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    return { x: Math.max(0, x), y: Math.max(0, y) }
+  }
+
+  const start = (e) => {
+    if (!state.ui.noteMode) return
+    if (e.button != null && e.button !== 0) return
+    drawing = true
+    currentStroke = {
+      color: NOTE_COLORS.find((c) => c.id === state.ui.noteColor)?.css ?? '#ef4444',
+      tool: state.ui.noteTool,
+      points: [toPoint(e)]
+    }
+    state.ui.noteStrokes.push(currentStroke)
+    canvas.setPointerCapture?.(e.pointerId)
+    e.preventDefault()
+  }
+
+  const move = (e) => {
+    if (!state.ui.noteMode || !drawing || !currentStroke) return
+    currentStroke.points.push(toPoint(e))
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const tool = currentStroke.tool || 'pen'
+    ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'
+    ctx.strokeStyle = currentStroke.color || '#ef4444'
+    ctx.lineWidth = tool === 'eraser' ? 14 : 2
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    const n = currentStroke.points.length
+    if (n < 2) return
+    const a = currentStroke.points[n - 2]
+    const b = currentStroke.points[n - 1]
+    ctx.beginPath()
+    ctx.moveTo(a.x, a.y)
+    ctx.lineTo(b.x, b.y)
+    ctx.stroke()
+    e.preventDefault()
+  }
+
+  const end = (e) => {
+    if (!drawing) return
+    drawing = false
+    currentStroke = null
+    e.preventDefault()
+  }
+
+  canvas.addEventListener('pointerdown', start, { signal: noteCanvasAbort.signal })
+  canvas.addEventListener('pointermove', move, { signal: noteCanvasAbort.signal })
+  canvas.addEventListener('pointerup', end, { signal: noteCanvasAbort.signal })
+  canvas.addEventListener('pointercancel', end, { signal: noteCanvasAbort.signal })
+
+  window.addEventListener('resize', () => redrawNoteCanvas(), { signal: noteCanvasAbort.signal })
+}
+
 function syncHighlighterToggleLabels() {
   const on = state.ui.highlighterMode
   document.querySelectorAll('.toggleHighlighterBtn').forEach((btn) => {
     btn.setAttribute('aria-pressed', on ? 'true' : 'false')
     btn.textContent = on ? '關閉熒光筆' : '熒光筆'
+  })
+}
+
+function persistHighlighterColor() {
+  try {
+    localStorage.setItem(HIGHLIGHT_COLOR_STORAGE_KEY, state.ui.highlighterColor)
+  } catch {
+    /* ignore */
+  }
+}
+
+function restoreHighlighterColorFromStorage() {
+  try {
+    const v = localStorage.getItem(HIGHLIGHT_COLOR_STORAGE_KEY)
+    if (typeof v === 'string' && HIGHLIGHT_COLORS.some((c) => c.id === v)) {
+      state.ui.highlighterColor = v
+      return
+    }
+  } catch {
+    /* ignore */
+  }
+  state.ui.highlighterColor = 'yellow'
+}
+
+function syncHighlighterColorPicker() {
+  const on = state.ui.highlighterMode
+  document.querySelectorAll('.hlToolGroup').forEach((group) => {
+    group.classList.toggle('isOpen', on)
+  })
+  document.querySelectorAll('.hlColorRow').forEach((row) => {
+    row.setAttribute('aria-hidden', on ? 'false' : 'true')
+  })
+  document.querySelectorAll('.hlColorBtn').forEach((btn) => {
+    const id = btn.dataset.hlColor
+    const isOn = id === state.ui.highlighterColor
+    btn.classList.toggle('isActive', isOn)
+    btn.setAttribute('aria-pressed', isOn ? 'true' : 'false')
+    btn.tabIndex = on ? 0 : -1
   })
 }
 
@@ -1523,6 +2063,10 @@ function resetScheduledLoadedKey() {
 
 async function bootstrap() {
   restoreBottomTabFromStorage()
+  restoreHideFirstColumnFromStorage()
+  restoreHideCompletedJobsFromStorage()
+  restoreHighlighterColorFromStorage()
+  restoreManualOddsFromStorage()
   mount()
   try {
     await loadMeetingsForSelectedDate()
@@ -1565,6 +2109,36 @@ function mount() {
     { signal: hideWithdrawnClickDelegationAbort.signal }
   )
 
+  document.querySelector('#app')?.addEventListener(
+    'click',
+    (e) => {
+      if (!e.target.closest('.toggleHideFirstColBtn')) return
+      e.preventDefault()
+      state.ui.hideFirstColumn = !state.ui.hideFirstColumn
+      persistHideFirstColumn()
+      renderLiveOddsTable()
+      if (supabase) renderScheduledPanel()
+      document.querySelectorAll('.toggleHideFirstColBtn').forEach((btn) => {
+        btn.setAttribute('aria-pressed', state.ui.hideFirstColumn ? 'true' : 'false')
+        btn.textContent = state.ui.hideFirstColumn ? '顯示左欄' : '隱藏左欄'
+      })
+    },
+    { signal: hideWithdrawnClickDelegationAbort.signal }
+  )
+
+  document.querySelector('#app')?.addEventListener(
+    'click',
+    (e) => {
+      if (!e.target.closest('.toggleHideCompletedJobsBtn')) return
+      e.preventDefault()
+      state.ui.hideCompletedJobs = !state.ui.hideCompletedJobs
+      persistHideCompletedJobs()
+      renderScheduleJobsListInDom()
+      syncHideCompletedJobsToggleLabels()
+    },
+    { signal: hideWithdrawnClickDelegationAbort.signal }
+  )
+
   highlighterClickDelegationAbort?.abort()
   highlighterClickDelegationAbort = new AbortController()
   document.querySelector('#app')?.addEventListener(
@@ -1575,18 +2149,81 @@ function mount() {
         toggleHighlighterMode()
         return
       }
+      if (e.target.closest('.toggleNoteBtn')) {
+        e.preventDefault()
+        toggleNoteMode()
+        return
+      }
+      if (e.target.closest('.clearNoteBtn')) {
+        e.preventDefault()
+        clearNote()
+        return
+      }
+      if (e.target.closest('.toggleEraserBtn')) {
+        e.preventDefault()
+        if (!state.ui.noteMode) return
+        toggleEraser()
+        return
+      }
+      const noteColorBtn = e.target.closest('.noteColorBtn')
+      if (noteColorBtn) {
+        e.preventDefault()
+        const id = noteColorBtn.dataset.noteColor
+        if (id && NOTE_COLORS.some((c) => c.id === id)) {
+          state.ui.noteColor = id
+          state.ui.noteTool = 'pen'
+          syncNoteModeDom()
+        }
+        return
+      }
+      const colorBtn = e.target.closest('.hlColorBtn')
+      if (colorBtn) {
+        e.preventDefault()
+        const id = colorBtn.dataset.hlColor
+        if (id && HIGHLIGHT_COLORS.some((c) => c.id === id)) {
+          state.ui.highlighterColor = id
+          persistHighlighterColor()
+          syncHighlighterColorPicker()
+        }
+        return
+      }
+      if (e.target.closest('.cellOddsInput')) return
       if (!state.ui.highlighterMode) return
       const cell = e.target.closest('[data-highlight-key]')
       if (!cell) return
       const key = cell.dataset.highlightKey
       if (!key) return
-      toggleCellHighlight(key)
-      cell.classList.toggle('isHighlighted', isCellHighlighted(key))
+      toggleCellHighlight(key, state.ui.highlighterColor)
+      const cls = `isHighlighted hl-${state.ui.highlighterColor}`
+      const cur = getCellHighlightColor(key)
+      if (!cur) {
+        cell.classList.remove('isHighlighted', ...HIGHLIGHT_COLORS.map((c) => `hl-${c.id}`))
+      } else {
+        cell.classList.add('isHighlighted')
+        cell.classList.remove(...HIGHLIGHT_COLORS.filter((c) => c.id !== cur).map((c) => `hl-${c.id}`))
+        cell.classList.add(`hl-${cur}`)
+      }
     },
     { signal: highlighterClickDelegationAbort.signal }
   )
 
   syncHighlighterModeDom()
+  syncNoteModeDom()
+  bindNoteCanvasEvents()
+
+  document.querySelector('#app')?.addEventListener(
+    'input',
+    (e) => {
+      const input = e.target.closest('.cellOddsInput')
+      if (!input) return
+      const raceNo = Number(input.dataset.raceNo)
+      const horseNo = Number(input.dataset.horseNo)
+      const field = input.dataset.field
+      if (!Number.isFinite(raceNo) || !Number.isFinite(horseNo) || (field !== 'win' && field !== 'place')) return
+      setManualOddsValue(raceNo, horseNo, field, input.value)
+    },
+    { signal: hideWithdrawnClickDelegationAbort.signal }
+  )
 
   const raceNoInput = document.querySelector('#raceNo')
 

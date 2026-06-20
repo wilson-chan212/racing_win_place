@@ -160,6 +160,249 @@ export function buildUrl(raceDate: string, meetingCode: string, raceNo: number) 
   return `https://bet.hkjc.com/en/racing/wp/${raceDate}/${encodeURIComponent(meetingCode)}/${raceNo}`
 }
 
+export function buildSpeedMapUrl(raceNo: number) {
+  return `https://racing.hkjc.com/zh-hk/local/info/speedpro/formguide?raceno=${raceNo}`
+}
+
+const SPEED_MAP_BUCKET = 'speed_maps'
+const DEFAULT_SCREENSHOT_API_URL = 'https://production-sfo.browserless.io/chromium/screenshot'
+
+/** HKJC SpeedPRO page shows venue in Chinese; map meeting codes from jobs. */
+export function speedMapVenueHints(meetingCode: string): string[] {
+  const code = meetingCode.trim().toUpperCase()
+  if (code === 'HV' || code.startsWith('HV')) return ['跑馬地']
+  if (code === 'ST' || code.startsWith('S')) return ['沙田']
+  return []
+}
+
+/** Page header uses DD/MM/YYYY (e.g. 21/06/2026). */
+export function speedMapDateLabels(raceDate: string): string[] {
+  const m = raceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!m) return [raceDate]
+  const [, y, mo, d] = m
+  return [
+    `${d}/${mo}/${y}`,
+    `${Number(d)}/${Number(mo)}/${y}`,
+    `${d}/${mo}/${y.slice(2)}`
+  ]
+}
+
+function readScreenshotConfig() {
+  const apiKey = Deno.env.get('SCREENSHOT_API_KEY')?.trim()
+  if (!apiKey) return null
+  const apiUrl = Deno.env.get('SCREENSHOT_API_URL')?.trim() || DEFAULT_SCREENSHOT_API_URL
+  return { apiKey, apiUrl }
+}
+
+function browserlessEndpoint(cfg: { apiKey: string; apiUrl: string }, path: 'screenshot' | 'content') {
+  const base = cfg.apiUrl.replace(/\/(screenshot|function|content)\/?$/i, '')
+  const url = `${base}/${path}`
+  if (url.includes('token=')) return url
+  if (url.includes('browserless.io')) {
+    const joiner = url.includes('?') ? '&' : '?'
+    return `${url}${joiner}token=${encodeURIComponent(cfg.apiKey)}`
+  }
+  return url
+}
+
+function screenshotApiHeaders(cfg: { apiKey: string; apiUrl: string }) {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (!cfg.apiUrl.includes('browserless.io') && !cfg.apiUrl.includes('token=')) {
+    headers.Authorization = `Bearer ${cfg.apiKey}`
+  }
+  return headers
+}
+
+function buildSpeedMapWaitFn(params: { raceDate: string; meetingCode: string; raceNo: number }) {
+  const dateLabels = speedMapDateLabels(params.raceDate)
+  const venueHints = speedMapVenueHints(params.meetingCode)
+  return `() => {
+    const t = document.body?.innerText ?? "";
+    if (/正在加載|loading/i.test(t)) return false;
+    if (!/走位圖|SPEED\\s*MAP/i.test(t)) return false;
+    const dates = ${JSON.stringify(dateLabels)};
+    if (!dates.some((d) => t.includes(d))) return false;
+    const venues = ${JSON.stringify(venueHints)};
+    if (venues.length && !venues.some((v) => t.includes(v))) return false;
+    const urlNo = Number(new URL(location.href).searchParams.get("raceno"));
+    return urlNo === ${params.raceNo};
+  }`
+}
+
+async function captureValidatedSpeedMapImage(
+  sourceUrl: string,
+  params: { raceDate: string; meetingCode: string; raceNo: number }
+): Promise<Uint8Array> {
+  const cfg = readScreenshotConfig()
+  if (!cfg) throw new Error('SCREENSHOT_API_KEY not configured')
+
+  const res = await fetch(browserlessEndpoint(cfg, 'screenshot'), {
+    method: 'POST',
+    headers: screenshotApiHeaders(cfg),
+    body: JSON.stringify({
+      url: sourceUrl,
+      gotoOptions: { waitUntil: 'networkidle2', timeout: 60_000 },
+      waitForFunction: { fn: buildSpeedMapWaitFn(params), timeout: 45_000 },
+      waitForTimeout: 3000,
+      viewport: { width: 1500, height: 900 },
+      options: {
+        type: 'png',
+        fullPage: false,
+        clip: { x: 0, y: 0, width: 1480, height: 580 }
+      }
+    })
+  })
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`Screenshot API failed (${res.status}): ${detail.slice(0, 300)}`)
+  }
+
+  const buf = new Uint8Array(await res.arrayBuffer())
+  if (buf.byteLength < 500) throw new Error('Screenshot API returned empty image')
+  return buf
+}
+
+function speedMapStoragePath(raceDate: string, meetingCode: string, raceNo: number) {
+  return `${raceDate}/${meetingCode}_R${raceNo}.png`
+}
+
+/** Capture HKJC Speed Map once per race (first scheduled extraction only). */
+export async function ensureSpeedMapCaptured(
+  supabase: ReturnType<typeof createClient>,
+  params: {
+    createdBy: string
+    raceDate: string
+    meetingCode: string
+    raceNo: number
+  }
+): Promise<{ captured: boolean; speedMapUrl?: string; skipped?: boolean }> {
+  const { raceDate, meetingCode, raceNo, createdBy } = params
+
+  const { data: existing, error: readErr } = await supabase
+    .from('race_metadata')
+    .select('speed_map_url')
+    .eq('race_date', raceDate)
+    .eq('meeting_code', meetingCode)
+    .eq('race_no', raceNo)
+    .maybeSingle()
+
+  if (readErr) throw new ExtractRaceError({ error: 'Failed to read race_metadata', details: readErr.message }, 500)
+  if (existing?.speed_map_url) {
+    return { captured: false, skipped: true, speedMapUrl: existing.speed_map_url }
+  }
+
+  if (!readScreenshotConfig()) return { captured: false, skipped: true }
+
+  await assertHkjcRaceExistsForSpeedMap(raceDate, meetingCode, raceNo)
+
+  const sourceUrl = buildSpeedMapUrl(raceNo)
+  const imageBytes = await captureValidatedSpeedMapImage(sourceUrl, { raceDate, meetingCode, raceNo })
+  const storagePath = speedMapStoragePath(raceDate, meetingCode, raceNo)
+
+  const { error: uploadErr } = await supabase.storage.from(SPEED_MAP_BUCKET).upload(storagePath, imageBytes, {
+    contentType: 'image/png',
+    upsert: true
+  })
+
+  if (uploadErr) throw new ExtractRaceError({ error: 'Speed map upload failed', details: uploadErr.message }, 500)
+
+  const { data: publicUrlData } = supabase.storage.from(SPEED_MAP_BUCKET).getPublicUrl(storagePath)
+  const speedMapUrl = publicUrlData.publicUrl
+  const capturedAt = new Date().toISOString()
+
+  const { error: upsertErr } = await supabase.from('race_metadata').upsert(
+    {
+      created_by: createdBy,
+      race_date: raceDate,
+      meeting_code: meetingCode,
+      race_no: raceNo,
+      speed_map_url: speedMapUrl,
+      speed_map_source_url: sourceUrl,
+      captured_at: capturedAt,
+      updated_at: capturedAt
+    },
+    { onConflict: 'race_date,meeting_code,race_no' }
+  )
+
+  if (upsertErr) {
+    throw new ExtractRaceError({ error: 'Failed to save race_metadata', details: upsertErr.message }, 500)
+  }
+
+  return { captured: true, speedMapUrl }
+}
+
+type SpeedMapRaceRef = {
+  createdBy: string
+  raceDate: string
+  meetingCode: string
+  raceNo: number
+}
+
+function uniqueRacesSorted(races: SpeedMapRaceRef[]): SpeedMapRaceRef[] {
+  const byKey = new Map<string, SpeedMapRaceRef>()
+  for (const race of races) {
+    const key = `${race.raceDate}|${race.meetingCode}|${race.raceNo}`
+    if (!byKey.has(key)) byKey.set(key, race)
+  }
+  return [...byKey.values()].sort((a, b) => {
+    const byDate = a.raceDate.localeCompare(b.raceDate)
+    if (byDate !== 0) return byDate
+    const byMeeting = a.meetingCode.localeCompare(b.meetingCode)
+    if (byMeeting !== 0) return byMeeting
+    return a.raceNo - b.raceNo
+  })
+}
+
+async function hasSpeedMapUrl(supabase: ReturnType<typeof createClient>, race: SpeedMapRaceRef) {
+  const { data } = await supabase
+    .from('race_metadata')
+    .select('speed_map_url')
+    .eq('race_date', race.raceDate)
+    .eq('meeting_code', race.meetingCode)
+    .eq('race_no', race.raceNo)
+    .maybeSingle()
+  return Boolean(data?.speed_map_url)
+}
+
+/** Capture at most one missing speed map per invocation (avoids Edge timeout + Browserless rate limits). */
+async function captureOneMissingSpeedMap(
+  supabase: ReturnType<typeof createClient>,
+  races: SpeedMapRaceRef[]
+) {
+  for (const race of uniqueRacesSorted(races)) {
+    if (await hasSpeedMapUrl(supabase, race)) continue
+    try {
+      await ensureSpeedMapCaptured(supabase, race)
+    } catch (e) {
+      console.error(
+        `Speed map capture failed for ${race.raceDate}|${race.meetingCode}|R${race.raceNo}:`,
+        formatExtractionError(e)
+      )
+    }
+    return
+  }
+}
+
+async function loadRacesMissingSpeedMapsFromCompletedJobs(
+  supabase: ReturnType<typeof createClient>
+): Promise<SpeedMapRaceRef[]> {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+  const { data: jobs, error } = await supabase
+    .from('race_extraction_jobs')
+    .select('created_by,race_date,meeting_code,race_no')
+    .eq('status', 'completed')
+    .gte('completed_at', since)
+
+  if (error || !jobs?.length) return []
+
+  const missing: SpeedMapRaceRef[] = []
+  for (const race of uniqueRacesSorted(jobs as SpeedMapRaceRef[])) {
+    if (!(await hasSpeedMapUrl(supabase, race))) missing.push(race)
+  }
+  return missing
+}
+
 /** HKJC meeting `date` may be "YYYY-MM-DD" or ISO; compare as calendar day in HK. */
 function normalizeHkjcMeetingDate(d: unknown): string | null {
   if (d == null || d === '') return null
@@ -465,6 +708,11 @@ export async function processDueExtractionJobs(
     if (dueJobs.length < batchSize) break
   }
 
+  const missingRaces = await loadRacesMissingSpeedMapsFromCompletedJobs(supabase)
+  if (missingRaces.length) {
+    await captureOneMissingSpeedMap(supabase, missingRaces)
+  }
+
   return { ok: true, processed: allResults.length, results: allResults }
 }
 
@@ -721,6 +969,33 @@ async function fetchHkjcGraphql<T>(
   }
 
   return body?.data as T
+}
+
+/** Pre-check via HKJC GraphQL before opening SpeedPRO in a browser. */
+async function assertHkjcRaceExistsForSpeedMap(raceDate: string, meetingCode: string, raceNo: number) {
+  const racePageReferer = buildUrl(raceDate, meetingCode, raceNo)
+
+  const raceData = await fetchHkjcGraphql<{
+    raceMeetings?: Array<{
+      date?: string | null
+      venueCode?: string | null
+      races?: Array<{ no?: string | number }>
+    }>
+  }>(
+    HKJC_RACE_QUERY,
+    { date: raceDate, venueCode: meetingCode },
+    { operationName: 'raceMeetings', referer: racePageReferer }
+  )
+
+  const meeting = raceData?.raceMeetings?.[0]
+  if (!meeting) {
+    throw new Error(`馬會未有 ${raceDate} ${meetingCode} 賽事（走位圖暫不截取）`)
+  }
+
+  const race = meeting.races?.find((r) => safeInt(r.no) === raceNo)
+  if (!race) {
+    throw new Error(`馬會未有 ${raceDate} ${meetingCode} 第${raceNo}場（走位圖暫不截取）`)
+  }
 }
 
 async function fetchGraphqlOdds(raceDate: string, meetingCode: string, raceNo: number) {
