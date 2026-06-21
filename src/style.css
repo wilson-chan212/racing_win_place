@@ -604,11 +604,25 @@ select.controlSelect:disabled {
   margin-top: 16px;
 }
 
-.scheduledTableRaceTitle {
+.scheduledTableRaceHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin: 0 0 8px;
+}
+
+.scheduledTableRaceTitle {
+  margin: 0;
   font-size: 15px;
   font-weight: 800;
   color: var(--text);
+}
+
+.saveRaceAnnotationBtn.isDirty {
+  color: var(--blue);
+  border-color: rgba(11, 103, 164, 0.35);
+  background: rgba(11, 103, 164, 0.06);
 }
 
 .speedMapBlock {

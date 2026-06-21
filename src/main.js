@@ -114,6 +114,8 @@ const state = {
     raceMetadata: [],
     /** User-entered win/place odds per horse — keys from manualOddsKey() */
     manualOdds: {},
+    /** Cached per-race saved annotations — keys from raceAnnotationScopeKey() */
+    raceAnnotations: {},
     loading: false,
     loadedKey: ''
   }
@@ -132,6 +134,7 @@ const BOTTOM_TAB_STORAGE_KEY = 'projectRace_bottomTab'
 const HIDE_FIRST_COL_STORAGE_KEY = 'projectRace_hideFirstColumn'
 const HIDE_COMPLETED_JOBS_STORAGE_KEY = 'projectRace_hideCompletedJobs'
 const MANUAL_ODDS_STORAGE_KEY = 'projectRace_manualOdds'
+const RACE_ANNOTATIONS_STORAGE_KEY = 'projectRace_raceAnnotations_v1'
 
 const HIGHLIGHT_COLORS = [
   { id: 'yellow', label: '黃', css: '#fff59a' },
@@ -282,6 +285,7 @@ function setManualOddsValue(raceNo, horseNo, field, value) {
   if (trimmed) state.scheduled.manualOdds[key] = trimmed
   else delete state.scheduled.manualOdds[key]
   persistManualOdds()
+  markRaceAnnotationDirty(raceNo)
 }
 
 function persistManualOdds() {
@@ -303,6 +307,274 @@ function restoreManualOddsFromStorage() {
   } catch {
     /* ignore */
   }
+}
+
+function raceAnnotationScopeKey(raceNo) {
+  return `${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}`
+}
+
+function raceAnnotationMeetingKey(raceDate = state.篩選.賽馬日, meetingCode = state.篩選.會場代號) {
+  return `${raceDate}|${meetingCode}`
+}
+
+function scheduledHighlightPrefix(raceNo) {
+  return `sch|${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}|`
+}
+
+function manualOddsPrefixForRace(raceNo) {
+  return `${state.篩選.賽馬日}|${state.篩選.會場代號}|${raceNo}|`
+}
+
+function scheduledHighlightRaceNo(key) {
+  if (!key.startsWith('sch|')) return null
+  const parts = key.split('|')
+  if (parts.length < 4) return null
+  const n = Number(parts[3])
+  return Number.isFinite(n) ? n : null
+}
+
+function emptyRaceAnnotationRecord() {
+  return { highlights: Object.create(null), noteStrokes: [], manualOdds: Object.create(null), updatedAt: null, dirty: false }
+}
+
+function ensureRaceAnnotationRecord(raceNo) {
+  const key = raceAnnotationScopeKey(raceNo)
+  if (!state.scheduled.raceAnnotations[key]) {
+    state.scheduled.raceAnnotations[key] = emptyRaceAnnotationRecord()
+  }
+  return state.scheduled.raceAnnotations[key]
+}
+
+function markRaceAnnotationDirty(raceNo) {
+  if (!Number.isFinite(raceNo)) return
+  ensureRaceAnnotationRecord(raceNo).dirty = true
+}
+
+function getHighlightsForRace(raceNo) {
+  const prefix = scheduledHighlightPrefix(raceNo)
+  const out = Object.create(null)
+  for (const [k, v] of Object.entries(getHighlightsByKey())) {
+    if (k.startsWith(prefix)) out[k] = v
+  }
+  return out
+}
+
+function mergeHighlightsForRace(raceNo, highlights) {
+  const prefix = scheduledHighlightPrefix(raceNo)
+  const map = getHighlightsByKey()
+  for (const k of Object.keys(map)) {
+    if (k.startsWith(prefix)) delete map[k]
+  }
+  if (highlights && typeof highlights === 'object') {
+    for (const [k, v] of Object.entries(highlights)) {
+      if (typeof k !== 'string' || !k.startsWith(prefix)) continue
+      if (typeof v === 'string' && HIGHLIGHT_COLORS.some((c) => c.id === v)) map[k] = v
+    }
+  }
+  persistHighlightsByKey()
+}
+
+function collectManualOddsForRace(raceNo) {
+  const prefix = manualOddsPrefixForRace(raceNo)
+  const out = Object.create(null)
+  for (const [k, v] of Object.entries(state.scheduled.manualOdds)) {
+    if (k.startsWith(prefix)) out[k] = v
+  }
+  return out
+}
+
+function mergeManualOddsForRace(raceNo, manualOdds) {
+  const prefix = manualOddsPrefixForRace(raceNo)
+  for (const k of Object.keys(state.scheduled.manualOdds)) {
+    if (k.startsWith(prefix)) delete state.scheduled.manualOdds[k]
+  }
+  if (manualOdds && typeof manualOdds === 'object') {
+    for (const [k, v] of Object.entries(manualOdds)) {
+      if (typeof k !== 'string' || !k.startsWith(prefix)) continue
+      if (String(v ?? '').trim()) state.scheduled.manualOdds[k] = String(v).trim()
+    }
+  }
+  persistManualOdds()
+}
+
+function normalizeNoteStrokes(raw) {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((stroke) => {
+    const points = Array.isArray(stroke) ? stroke : stroke?.points
+    return Array.isArray(points) && points.length >= 2
+  })
+}
+
+function flushNoteStrokesForRace(raceNo) {
+  if (!Number.isFinite(raceNo)) return
+  const rec = ensureRaceAnnotationRecord(raceNo)
+  rec.noteStrokes = JSON.parse(JSON.stringify(state.ui.noteStrokes))
+  persistRaceAnnotationsLocalForMeeting()
+}
+
+function loadNoteStrokesForRace(raceNo) {
+  if (!Number.isFinite(raceNo)) {
+    state.ui.noteStrokes = []
+    return
+  }
+  const rec = ensureRaceAnnotationRecord(raceNo)
+  state.ui.noteStrokes = JSON.parse(JSON.stringify(rec.noteStrokes ?? []))
+}
+
+function applyRaceAnnotationRecord(raceNo, record, { markSaved = true } = {}) {
+  if (!Number.isFinite(raceNo) || !record) return
+  const key = raceAnnotationScopeKey(raceNo)
+  mergeHighlightsForRace(raceNo, record.highlights && typeof record.highlights === 'object' ? record.highlights : Object.create(null))
+  mergeManualOddsForRace(
+    raceNo,
+    record.manualOdds && typeof record.manualOdds === 'object'
+      ? record.manualOdds
+      : record.manual_odds && typeof record.manual_odds === 'object'
+        ? record.manual_odds
+        : Object.create(null)
+  )
+  state.scheduled.raceAnnotations[key] = {
+    highlights: getHighlightsForRace(raceNo),
+    noteStrokes: normalizeNoteStrokes(record.noteStrokes ?? record.note_strokes),
+    manualOdds: collectManualOddsForRace(raceNo),
+    updatedAt: record.updatedAt ?? record.updated_at ?? null,
+    dirty: !markSaved
+  }
+}
+
+function collectRaceAnnotationPayload(raceNo) {
+  if (state.scheduled.viewRaceNo === raceNo) flushNoteStrokesForRace(raceNo)
+  return {
+    highlights: getHighlightsForRace(raceNo),
+    note_strokes: ensureRaceAnnotationRecord(raceNo).noteStrokes ?? [],
+    manual_odds: collectManualOddsForRace(raceNo)
+  }
+}
+
+function readRaceAnnotationsLocalStore() {
+  try {
+    const raw = localStorage.getItem(RACE_ANNOTATIONS_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : Object.create(null)
+  } catch {
+    return Object.create(null)
+  }
+}
+
+function writeRaceAnnotationsLocalStore(store) {
+  try {
+    localStorage.setItem(RACE_ANNOTATIONS_STORAGE_KEY, JSON.stringify(store))
+  } catch {
+    // ignore quota / privacy mode
+  }
+}
+
+function persistRaceAnnotationsLocalForMeeting() {
+  const meetingKey = raceAnnotationMeetingKey()
+  const store = readRaceAnnotationsLocalStore()
+  const bucket = store[meetingKey] && typeof store[meetingKey] === 'object' ? store[meetingKey] : Object.create(null)
+  for (const [scopeKey, rec] of Object.entries(state.scheduled.raceAnnotations)) {
+    if (!scopeKey.startsWith(`${meetingKey}|`)) continue
+    const raceNo = Number(scopeKey.slice(meetingKey.length + 1))
+    if (Number.isFinite(raceNo)) {
+      rec.highlights = getHighlightsForRace(raceNo)
+      rec.manualOdds = collectManualOddsForRace(raceNo)
+    }
+    bucket[scopeKey.slice(meetingKey.length + 1)] = {
+      highlights: rec.highlights ?? Object.create(null),
+      noteStrokes: rec.noteStrokes ?? [],
+      manualOdds: rec.manualOdds ?? Object.create(null),
+      updatedAt: rec.updatedAt ?? new Date().toISOString()
+    }
+  }
+  store[meetingKey] = bucket
+  writeRaceAnnotationsLocalStore(store)
+}
+
+function restoreRaceAnnotationsLocalForMeeting(raceDate = state.篩選.賽馬日, meetingCode = state.篩選.會場代號) {
+  const meetingKey = raceAnnotationMeetingKey(raceDate, meetingCode)
+  const bucket = readRaceAnnotationsLocalStore()[meetingKey]
+  if (!bucket || typeof bucket !== 'object') return
+  for (const [raceNoStr, rec] of Object.entries(bucket)) {
+    const raceNo = Number(raceNoStr)
+    if (!Number.isFinite(raceNo)) continue
+    applyRaceAnnotationRecord(raceNo, rec, { markSaved: true })
+  }
+}
+
+async function saveRaceAnnotation(raceNo) {
+  assertSupabaseConfigured()
+  const scope = readScheduledScopeFilter()
+  const payload = collectRaceAnnotationPayload(raceNo)
+  const updatedAt = new Date().toISOString()
+  const { error } = await supabase.from('race_annotations').upsert(
+    {
+      race_date: scope.raceDate,
+      meeting_code: scope.meetingCode,
+      race_no: raceNo,
+      highlights: payload.highlights,
+      note_strokes: payload.note_strokes,
+      manual_odds: payload.manual_odds,
+      updated_at: updatedAt
+    },
+    { onConflict: 'race_date,meeting_code,race_no' }
+  )
+  if (error) throw new Error(error.message)
+
+  applyRaceAnnotationRecord(
+    raceNo,
+    {
+      highlights: payload.highlights,
+      noteStrokes: payload.note_strokes,
+      manualOdds: payload.manual_odds,
+      updatedAt
+    },
+    { markSaved: true }
+  )
+  persistRaceAnnotationsLocalForMeeting()
+
+  const resultsHost = document.querySelector('#scheduledResultsHost')
+  if (resultsHost && state.scheduled.viewRaceNo === raceNo) {
+    resultsHost.innerHTML = scheduledResultTableTemplate()
+  }
+  syncSaveRaceAnnotationButtons()
+}
+
+async function loadRaceAnnotationsForMeeting(scope) {
+  restoreRaceAnnotationsLocalForMeeting(scope.raceDate, scope.meetingCode)
+  try {
+    const rows = await fetchAllSupabaseRows(() =>
+      supabase
+        .from('race_annotations')
+        .select('race_no,highlights,note_strokes,manual_odds,updated_at')
+        .eq('race_date', scope.raceDate)
+        .eq('meeting_code', scope.meetingCode)
+        .order('race_no', { ascending: true })
+    )
+    for (const row of rows) {
+      const raceNo = Number(row.race_no)
+      if (!Number.isFinite(raceNo)) continue
+      applyRaceAnnotationRecord(raceNo, {
+        highlights: row.highlights ?? Object.create(null),
+        noteStrokes: row.note_strokes ?? [],
+        manualOdds: row.manual_odds ?? Object.create(null),
+        updatedAt: row.updated_at ?? null
+      })
+    }
+  } catch {
+    // Table may not exist until migration is applied; local backup still works.
+  }
+}
+
+function syncSaveRaceAnnotationButtons() {
+  document.querySelectorAll('.saveRaceAnnotationBtn').forEach((btn) => {
+    const raceNo = Number(btn.dataset.raceNo)
+    const rec = Number.isFinite(raceNo) ? ensureRaceAnnotationRecord(raceNo) : null
+    const dirty = Boolean(rec?.dirty)
+    btn.classList.toggle('isDirty', dirty)
+    btn.textContent = dirty ? '儲存標示 *' : '儲存標示'
+    btn.setAttribute('aria-label', dirty ? `儲存第${raceNo}場標示（有未儲存變更）` : `儲存第${raceNo}場標示`)
+  })
 }
 
 function highlightCellClassSuffix(key) {
@@ -1021,7 +1293,10 @@ function scheduledResultTableForRace(raceNo) {
 
   return `
     <div class="scheduledTableBlock">
-      <h3 class="scheduledTableRaceTitle">第${raceNo}場</h3>
+      <div class="scheduledTableRaceHead">
+        <h3 class="scheduledTableRaceTitle">第${raceNo}場</h3>
+        <button type="button" class="ghostBtn saveRaceAnnotationBtn" data-race-no="${raceNo}">儲存標示</button>
+      </div>
       ${speedMapSectionForRace(raceNo)}
       <div class="scheduledTableWrap" role="region" aria-label="預定抄賠率結果 第${raceNo}場">
       <table class="scheduledTable${state.ui.hideFirstColumn ? ' hideFirstCol' : ''}">
@@ -1428,6 +1703,11 @@ async function loadScheduledData(force = false, { processDue = true } = {}) {
   if (!force && state.scheduled.loadedKey === key && state.scheduled.jobs.length) return
 
   state.scheduled.loading = true
+  const prevViewRace = state.scheduled.viewRaceNo
+  if (prevViewRace != null) flushNoteStrokesForRace(prevViewRace)
+  if (force || state.scheduled.loadedKey !== key) {
+    state.scheduled.raceAnnotations = Object.create(null)
+  }
   renderScheduledPanel()
   try {
     const jobs = await fetchAllSupabaseRows(() =>
@@ -1465,6 +1745,7 @@ async function loadScheduledData(force = false, { processDue = true } = {}) {
     state.scheduled.raceMetadata = raceMetadata
     state.scheduled.loadedKey = key
     syncScheduledViewRaceForMeeting()
+    await loadRaceAnnotationsForMeeting(scope)
   } catch (e) {
     showToast(String(e?.message ?? e))
   } finally {
@@ -1627,6 +1908,8 @@ function syncLiveOnlyChrome() {
 function renderScheduledPanel() {
   const panel = document.querySelector('#panelScheduled')
   if (!panel) return
+  const prevViewRace = state.scheduled.viewRaceNo
+  if (prevViewRace != null) flushNoteStrokesForRace(prevViewRace)
   panel.innerHTML = scheduledTemplate()
   bindScheduledEvents()
   bindScheduleViewRacePickButtons()
@@ -1636,6 +1919,9 @@ function renderScheduledPanel() {
   syncHighlighterToggleLabels()
   syncNoteModeDom()
   bindNoteCanvasEvents()
+  if (prevViewRace != null) loadNoteStrokesForRace(prevViewRace)
+  redrawNoteCanvas()
+  syncSaveRaceAnnotationButtons()
 }
 
 function updateScheduleRacePickButtonsInDom() {
@@ -1676,7 +1962,10 @@ function bindScheduleViewRacePickButtons() {
       const r = Number(button.dataset.raceNo)
       if (!Number.isFinite(r) || r < 1) return
       if (r === state.scheduled.viewRaceNo) return
+      const prev = state.scheduled.viewRaceNo
+      if (prev != null) flushNoteStrokesForRace(prev)
       state.scheduled.viewRaceNo = r
+      loadNoteStrokesForRace(r)
       updateScheduleViewRacePickButtonsInDom()
       const resultsHost = document.querySelector('#scheduledResultsHost')
       if (resultsHost) {
@@ -1684,6 +1973,8 @@ function bindScheduleViewRacePickButtons() {
       } else if (supabase) {
         renderScheduledPanel()
       }
+      redrawNoteCanvas()
+      syncSaveRaceAnnotationButtons()
       scheduleRefreshRaceSubtitle(0)
       syncHkjcWpLinkHref()
     })
@@ -1818,8 +2109,16 @@ function toggleEraser() {
 }
 
 function clearNote() {
+  const raceNo = state.scheduled.viewRaceNo
   state.ui.noteStrokes = []
+  if (raceNo != null) {
+    const rec = ensureRaceAnnotationRecord(raceNo)
+    rec.noteStrokes = []
+    markRaceAnnotationDirty(raceNo)
+    persistRaceAnnotationsLocalForMeeting()
+  }
   redrawNoteCanvas()
+  syncSaveRaceAnnotationButtons()
   showToast('已清除筆記')
 }
 
@@ -1902,8 +2201,9 @@ function bindNoteCanvasEvents() {
   noteCanvasAbort = new AbortController()
 
   const DRAW_SLOP_PX = 8
-  /** Finger drags that look like vertical scroll (not pen strokes) */
-  const SCROLL_VERTICAL_BIAS = 1.8
+  /** Fast mostly-vertical flicks = scroll; slow drags (incl. circles) = draw */
+  const SCROLL_SPEED_PX_MS = 0.45
+  const SCROLL_VERTICAL_BIAS = 1.35
 
   let drawing = false
   let currentStroke = null
@@ -1945,7 +2245,7 @@ function bindNoteCanvasEvents() {
     }
 
     pendingPointerId = e.pointerId
-    pendingStart = { x: e.clientX, y: e.clientY }
+    pendingStart = { x: e.clientX, y: e.clientY, t: performance.now() }
   }
 
   const move = (e) => {
@@ -1957,7 +2257,10 @@ function bindNoteCanvasEvents() {
       const dist = Math.hypot(dx, dy)
       if (dist < DRAW_SLOP_PX) return
 
-      if (Math.abs(dy) > Math.abs(dx) * SCROLL_VERTICAL_BIAS) {
+      const dt = Math.max(performance.now() - pendingStart.t, 1)
+      const speed = dist / dt
+      const mostlyVertical = Math.abs(dy) > Math.abs(dx) * SCROLL_VERTICAL_BIAS
+      if (mostlyVertical && speed > SCROLL_SPEED_PX_MS) {
         clearPending()
         return
       }
@@ -1994,6 +2297,12 @@ function bindNoteCanvasEvents() {
     if (!drawing) return
     drawing = false
     currentStroke = null
+    const raceNo = state.scheduled.viewRaceNo
+    if (raceNo != null) {
+      flushNoteStrokesForRace(raceNo)
+      markRaceAnnotationDirty(raceNo)
+      syncSaveRaceAnnotationButtons()
+    }
     e.preventDefault()
   }
 
@@ -2097,6 +2406,7 @@ function resetScheduledLoadedKey() {
   state.scheduled.loadedKey = ''
   state.scheduled.jobs = []
   state.scheduled.snapshots = []
+  state.scheduled.raceAnnotations = Object.create(null)
   if (state.ui.bottomTab === 'scheduled') {
     renderScheduledPanel()
     loadScheduledData(true).catch((e) => showToast(String(e?.message ?? e)))
@@ -2245,6 +2555,12 @@ function mount() {
         cell.classList.remove(...HIGHLIGHT_COLORS.filter((c) => c.id !== cur).map((c) => `hl-${c.id}`))
         cell.classList.add(`hl-${cur}`)
       }
+      const raceNo = scheduledHighlightRaceNo(key)
+      if (raceNo != null && state.ui.bottomTab === 'scheduled') {
+        markRaceAnnotationDirty(raceNo)
+        persistRaceAnnotationsLocalForMeeting()
+        syncSaveRaceAnnotationButtons()
+      }
     },
     { signal: highlighterClickDelegationAbort.signal }
   )
@@ -2252,6 +2568,27 @@ function mount() {
   syncHighlighterModeDom()
   syncNoteModeDom()
   bindNoteCanvasEvents()
+
+  document.querySelector('#app')?.addEventListener(
+    'click',
+    (e) => {
+      const saveBtn = e.target.closest('.saveRaceAnnotationBtn')
+      if (saveBtn) {
+        e.preventDefault()
+        const raceNo = Number(saveBtn.dataset.raceNo)
+        if (!Number.isFinite(raceNo)) return
+        saveBtn.disabled = true
+        saveRaceAnnotation(raceNo)
+          .then(() => showToast(`第${raceNo}場標示已儲存`))
+          .catch((err) => showToast(String(err?.message ?? err)))
+          .finally(() => {
+            saveBtn.disabled = false
+          })
+        return
+      }
+    },
+    { signal: hideWithdrawnClickDelegationAbort.signal }
+  )
 
   document.querySelector('#app')?.addEventListener(
     'input',
@@ -2263,6 +2600,7 @@ function mount() {
       const field = input.dataset.field
       if (!Number.isFinite(raceNo) || !Number.isFinite(horseNo) || (field !== 'win' && field !== 'place')) return
       setManualOddsValue(raceNo, horseNo, field, input.value)
+      syncSaveRaceAnnotationButtons()
     },
     { signal: hideWithdrawnClickDelegationAbort.signal }
   )
