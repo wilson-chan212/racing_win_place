@@ -648,6 +648,19 @@ select.controlSelect:disabled {
   color: var(--text);
 }
 
+.speedMapActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.speedMapActions .ghostBtn {
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
 .speedMapBlock--status {
   min-height: 74px;
 }
@@ -684,6 +697,10 @@ select.controlSelect:disabled {
   border-radius: 6px;
   border: 1px solid #edf0f4;
   background: #f8fafc;
+}
+
+.speedMapImage[hidden] {
+  display: none;
 }
 
 .scheduleJobActions {

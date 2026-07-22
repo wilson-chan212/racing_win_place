@@ -85,6 +85,8 @@ const state = {
     hideWithdrawnHorses: false,
     /** Hide the first (left-most) column in tables */
     hideFirstColumn: false,
+    /** Hide the speed map image while keeping its header and source link visible */
+    hideSpeedMap: false,
     /** Hide finished 預約提取 rows (completed / failed / cancelled) */
     hideCompletedJobs: false,
     /** Tap table cells to apply fixed light-yellow highlight */
@@ -1290,17 +1292,27 @@ function speedMapSectionForRace(raceNo) {
     <div class="speedMapBlock" aria-label="第${raceNo}場走位圖">
       <div class="speedMapHeader">
         <h4 class="speedMapTitle">走位圖</h4>
-        ${
-          meta.speed_map_source_url
-            ? `<a class="speedMapSourceLink" href="${escapeHtml(meta.speed_map_source_url)}" target="_blank" rel="noopener noreferrer">馬會來源</a>`
-            : ''
-        }
+        <div class="speedMapActions">
+          <button
+            type="button"
+            class="ghostBtn toggleSpeedMapBtn"
+            aria-controls="speed-map-${raceNo}"
+            aria-pressed="${state.ui.hideSpeedMap ? 'true' : 'false'}"
+          >${state.ui.hideSpeedMap ? '顯示走位圖' : '隱藏走位圖'}</button>
+          ${
+            meta.speed_map_source_url
+              ? `<a class="speedMapSourceLink" href="${escapeHtml(meta.speed_map_source_url)}" target="_blank" rel="noopener noreferrer">馬會來源</a>`
+              : ''
+          }
+        </div>
       </div>
       <img
+        id="speed-map-${raceNo}"
         class="speedMapImage"
         src="${escapeHtml(meta.speed_map_url)}"
         alt="第${raceNo}場走位圖"
         loading="lazy"
+        ${state.ui.hideSpeedMap ? 'hidden' : ''}
       />
     </div>
   `
@@ -2603,6 +2615,24 @@ function mount() {
       document.querySelectorAll('.toggleHideFirstColBtn').forEach((btn) => {
         btn.setAttribute('aria-pressed', state.ui.hideFirstColumn ? 'true' : 'false')
         btn.textContent = state.ui.hideFirstColumn ? '顯示左欄' : '隱藏左欄'
+      })
+    },
+    { signal: hideWithdrawnClickDelegationAbort.signal }
+  )
+
+  document.querySelector('#app')?.addEventListener(
+    'click',
+    (e) => {
+      const button = e.target.closest('.toggleSpeedMapBtn')
+      if (!button) return
+      e.preventDefault()
+      state.ui.hideSpeedMap = !state.ui.hideSpeedMap
+      document.querySelectorAll('.speedMapImage').forEach((image) => {
+        image.hidden = state.ui.hideSpeedMap
+      })
+      document.querySelectorAll('.toggleSpeedMapBtn').forEach((btn) => {
+        btn.setAttribute('aria-pressed', state.ui.hideSpeedMap ? 'true' : 'false')
+        btn.textContent = state.ui.hideSpeedMap ? '顯示走位圖' : '隱藏走位圖'
       })
     },
     { signal: hideWithdrawnClickDelegationAbort.signal }
