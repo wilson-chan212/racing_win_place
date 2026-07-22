@@ -568,12 +568,30 @@ async function loadRaceAnnotationsForMeeting(scope) {
 
 function syncSaveRaceAnnotationButtons() {
   document.querySelectorAll('.saveRaceAnnotationBtn').forEach((btn) => {
-    const raceNo = Number(btn.dataset.raceNo)
-    const rec = Number.isFinite(raceNo) ? ensureRaceAnnotationRecord(raceNo) : null
+    const isToolbarButton = btn.classList.contains('saveRaceAnnotationToolbarBtn')
+    const raceNo = Number(isToolbarButton ? state.scheduled.viewRaceNo : btn.dataset.raceNo)
+    const hasRace = Number.isInteger(raceNo) && raceNo >= 1
+    if (isToolbarButton) {
+      if (hasRace) {
+        btn.dataset.raceNo = String(raceNo)
+      } else {
+        delete btn.dataset.raceNo
+      }
+    }
+    btn.disabled = state.scheduled.loading || !hasRace
+    const rec = hasRace ? ensureRaceAnnotationRecord(raceNo) : null
     const dirty = Boolean(rec?.dirty)
+    const label = isToolbarButton ? '儲存筆記及標示' : '儲存標示'
     btn.classList.toggle('isDirty', dirty)
-    btn.textContent = dirty ? '儲存標示 *' : '儲存標示'
-    btn.setAttribute('aria-label', dirty ? `儲存第${raceNo}場標示（有未儲存變更）` : `儲存第${raceNo}場標示`)
+    btn.textContent = dirty ? `${label} *` : label
+    btn.setAttribute(
+      'aria-label',
+      hasRace
+        ? dirty
+          ? `儲存第${raceNo}場筆記及標示（有未儲存變更）`
+          : `儲存第${raceNo}場筆記及標示`
+        : '請先選擇場次'
+    )
   })
 }
 
@@ -651,12 +669,63 @@ function syncAppBarHeadline() {
 
 function meetingOptionLabel(m) {
   const venueHints = { ST: '沙田', HV: '跑馬地' }
-  const place = m.countryCh || m.countryEn || venueHints[m.venueCode] || '馬會'
+  const place =
+    m.countryCh || m.countryEn || venueHints[m.venueCode] || (m.fromSaved ? '已保存紀錄' : '馬會')
   const races =
     m.totalNumberOfRace != null && m.totalNumberOfRace >= 1
       ? `共 ${m.totalNumberOfRace} 場`
       : '場次待定'
   return `${m.venueCode} · ${place} · ${races}`
+}
+
+/** Build meeting rows from saved 預定提取 jobs when HKJC no longer lists that day. */
+async function fetchSavedMeetingsForDate(raceDate) {
+  if (!supabase || !raceDate) return []
+  const rows = await fetchAllSupabaseRows(() =>
+    supabase.from('race_extraction_jobs').select('meeting_code,race_no').eq('race_date', raceDate)
+  )
+  const byVenue = new Map()
+  for (const row of rows) {
+    const code = String(row.meeting_code ?? '').trim()
+    const raceNo = Number(row.race_no)
+    if (!code || !Number.isFinite(raceNo) || raceNo < 1) continue
+    const n = Math.trunc(raceNo)
+    const prev = byVenue.get(code) ?? 0
+    if (n > prev) byVenue.set(code, n)
+  }
+  return [...byVenue.entries()]
+    .map(([venueCode, totalNumberOfRace]) => ({
+      venueCode,
+      date: raceDate,
+      totalNumberOfRace: Math.min(99, totalNumberOfRace),
+      countryCh: '',
+      countryEn: '',
+      fromSaved: true
+    }))
+    .sort((a, b) => a.venueCode.localeCompare(b.venueCode))
+}
+
+/** Prefer live HKJC meeting meta; raise race cap / keep venues that only exist in saved jobs. */
+function mergeDayMeetingsWithSaved(hkjcList, savedList) {
+  const byVenue = new Map()
+  for (const m of hkjcList ?? []) {
+    byVenue.set(m.venueCode, { ...m, fromSaved: false })
+  }
+  for (const m of savedList ?? []) {
+    const existing = byVenue.get(m.venueCode)
+    if (!existing) {
+      byVenue.set(m.venueCode, { ...m })
+      continue
+    }
+    const a = existing.totalNumberOfRace ?? 0
+    const b = m.totalNumberOfRace ?? 0
+    const maxRaces = Math.max(a, b)
+    byVenue.set(m.venueCode, {
+      ...existing,
+      totalNumberOfRace: maxRaces >= 1 ? Math.min(99, maxRaces) : existing.totalNumberOfRace
+    })
+  }
+  return [...byVenue.values()].sort((a, b) => a.venueCode.localeCompare(b.venueCode))
 }
 
 function hideWithdrawnToggleButtonHtml() {
@@ -727,11 +796,18 @@ function noteEraserToggleButtonHtml() {
   return `<button type="button" class="ghostBtn toggleEraserBtn${isEraser ? ' isActive' : ''}" aria-pressed="${isEraser ? 'true' : 'false'}"${hidden}>橡皮擦</button>`
 }
 
+function saveRaceAnnotationToolbarButtonHtml() {
+  const raceNo = Number(state.scheduled.viewRaceNo)
+  const hasRace = Number.isInteger(raceNo) && raceNo >= 1
+  const disabled = state.scheduled.loading || !hasRace
+  return `<button type="button" class="ghostBtn saveRaceAnnotationBtn saveRaceAnnotationToolbarBtn"${hasRace ? ` data-race-no="${raceNo}"` : ''}${disabled ? ' disabled' : ''}>儲存筆記及標示</button>`
+}
+
 function hkjcWpAndHideRowFragment(linkId) {
   const href = buildHkjcWpOddsUrl('ch', state.篩選.賽馬日, state.篩選.會場代號, state.篩選.場次編號)
   const noteControls =
     state.ui.bottomTab === 'scheduled'
-      ? `${noteToolHtml()}${noteClearButtonHtml()}${noteEraserToggleButtonHtml()}`
+      ? `${noteToolHtml()}${noteClearButtonHtml()}${noteEraserToggleButtonHtml()}${saveRaceAnnotationToolbarButtonHtml()}`
       : ''
   return `
         <a
@@ -1189,7 +1265,26 @@ function scheduleJobsTemplate(jobs) {
 
 function speedMapSectionForRace(raceNo) {
   const meta = state.scheduled.raceMetadata.find((row) => row.race_no === raceNo)
-  if (!meta?.speed_map_url) return ''
+  if (!meta?.speed_map_url) {
+    const status = meta?.speed_map_status ?? 'pending'
+    const statusText =
+      status === 'unavailable'
+        ? '馬會尚未發布走位圖'
+        : status === 'retrying'
+          ? '截圖失敗，稍後重試'
+          : '等待截圖'
+
+    return `
+      <div class="speedMapBlock speedMapBlock--status" aria-label="第${raceNo}場走位圖狀態">
+        <div class="speedMapHeader">
+          <h4 class="speedMapTitle">走位圖</h4>
+        </div>
+        <div class="speedMapStatus speedMapStatus--${escapeHtml(status)}" role="status">
+          ${escapeHtml(statusText)}
+        </div>
+      </div>
+    `
+  }
 
   return `
     <div class="speedMapBlock" aria-label="第${raceNo}場走位圖">
@@ -1295,7 +1390,6 @@ function scheduledResultTableForRace(raceNo) {
     <div class="scheduledTableBlock">
       <div class="scheduledTableRaceHead">
         <h3 class="scheduledTableRaceTitle">第${raceNo}場</h3>
-        <button type="button" class="ghostBtn saveRaceAnnotationBtn" data-race-no="${raceNo}">儲存標示</button>
       </div>
       ${speedMapSectionForRace(raceNo)}
       <div class="scheduledTableWrap" role="region" aria-label="預定抄賠率結果 第${raceNo}場">
@@ -1554,10 +1648,32 @@ async function loadMeetingsForSelectedDate(options = {}) {
   }
   mount()
   try {
-    const list = await fetchMeetingsForCalendarDate(state.篩選.賽馬日)
+    let hkjcList = []
+    let hkjcError = null
+    try {
+      hkjcList = await fetchMeetingsForCalendarDate(state.篩選.賽馬日)
+    } catch (e) {
+      hkjcError = e
+      hkjcList = []
+    }
     if (seq !== meetingsLoadSeq) return
+
+    let savedList = []
+    if (supabase) {
+      try {
+        savedList = await fetchSavedMeetingsForDate(state.篩選.賽馬日)
+      } catch {
+        // keep HKJC list if saved lookup fails
+      }
+    }
+    if (seq !== meetingsLoadSeq) return
+
+    const list = mergeDayMeetingsWithSaved(hkjcList, savedList)
     state.ui.dayMeetings = list
     applyMeetingSelectionFromDayList(list)
+    if (!list.length && hkjcError) {
+      showToast(String(hkjcError?.message ?? hkjcError))
+    }
   } catch (e) {
     if (seq !== meetingsLoadSeq) return
     state.ui.dayMeetings = []
@@ -1731,14 +1847,28 @@ async function loadScheduledData(force = false, { processDue = true } = {}) {
         .order('extracted_at', { ascending: true })
     )
 
-    const raceMetadata = await fetchAllSupabaseRows(() =>
+    const buildRaceMetadataQuery = (columns) => () =>
       supabase
         .from('race_metadata')
-        .select('race_no,speed_map_url,speed_map_source_url,captured_at')
+        .select(columns)
         .eq('race_date', scope.raceDate)
         .eq('meeting_code', scope.meetingCode)
         .order('race_no', { ascending: true })
-    )
+
+    let raceMetadata
+    try {
+      raceMetadata = await fetchAllSupabaseRows(
+        buildRaceMetadataQuery(
+          'race_no,speed_map_url,speed_map_source_url,speed_map_status,speed_map_last_error,speed_map_attempt_count,speed_map_next_retry_at,captured_at'
+        )
+      )
+    } catch (e) {
+      const message = String(e?.message ?? e)
+      if (!message.includes('race_metadata.speed_map_') || !message.includes('does not exist')) throw e
+      raceMetadata = await fetchAllSupabaseRows(
+        buildRaceMetadataQuery('race_no,speed_map_url,speed_map_source_url,captured_at')
+      )
+    }
 
     state.scheduled.jobs = jobs
     state.scheduled.snapshots = snapshots
@@ -2575,15 +2705,17 @@ function mount() {
       const saveBtn = e.target.closest('.saveRaceAnnotationBtn')
       if (saveBtn) {
         e.preventDefault()
+        if (state.scheduled.loading) {
+          showToast('標示載入中，請稍候')
+          return
+        }
         const raceNo = Number(saveBtn.dataset.raceNo)
-        if (!Number.isFinite(raceNo)) return
+        if (!Number.isInteger(raceNo) || raceNo < 1) return
         saveBtn.disabled = true
         saveRaceAnnotation(raceNo)
           .then(() => showToast(`第${raceNo}場標示已儲存`))
           .catch((err) => showToast(String(err?.message ?? err)))
-          .finally(() => {
-            saveBtn.disabled = false
-          })
+          .finally(() => syncSaveRaceAnnotationButtons())
         return
       }
     },

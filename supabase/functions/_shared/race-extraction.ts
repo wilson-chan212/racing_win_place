@@ -281,7 +281,7 @@ export async function ensureSpeedMapCaptured(
 
   const { data: existing, error: readErr } = await supabase
     .from('race_metadata')
-    .select('speed_map_url')
+    .select('speed_map_url,speed_map_attempt_count,speed_map_next_retry_at')
     .eq('race_date', raceDate)
     .eq('meeting_code', meetingCode)
     .eq('race_no', raceNo)
@@ -292,44 +292,92 @@ export async function ensureSpeedMapCaptured(
     return { captured: false, skipped: true, speedMapUrl: existing.speed_map_url }
   }
 
-  if (!readScreenshotConfig()) return { captured: false, skipped: true }
-
-  await assertHkjcRaceExistsForSpeedMap(raceDate, meetingCode, raceNo)
-
   const sourceUrl = buildSpeedMapUrl(raceNo)
-  const imageBytes = await captureValidatedSpeedMapImage(sourceUrl, { raceDate, meetingCode, raceNo })
-  const storagePath = speedMapStoragePath(raceDate, meetingCode, raceNo)
+  const attemptCount = Number(existing?.speed_map_attempt_count ?? 0) + 1
+  const startedAt = new Date().toISOString()
 
-  const { error: uploadErr } = await supabase.storage.from(SPEED_MAP_BUCKET).upload(storagePath, imageBytes, {
-    contentType: 'image/png',
-    upsert: true
-  })
-
-  if (uploadErr) throw new ExtractRaceError({ error: 'Speed map upload failed', details: uploadErr.message }, 500)
-
-  const { data: publicUrlData } = supabase.storage.from(SPEED_MAP_BUCKET).getPublicUrl(storagePath)
-  const speedMapUrl = publicUrlData.publicUrl
-  const capturedAt = new Date().toISOString()
-
-  const { error: upsertErr } = await supabase.from('race_metadata').upsert(
+  const { error: capturingErr } = await supabase.from('race_metadata').upsert(
     {
       created_by: createdBy,
       race_date: raceDate,
       meeting_code: meetingCode,
       race_no: raceNo,
-      speed_map_url: speedMapUrl,
+      speed_map_status: 'capturing',
       speed_map_source_url: sourceUrl,
-      captured_at: capturedAt,
-      updated_at: capturedAt
+      speed_map_last_error: null,
+      speed_map_attempt_count: attemptCount,
+      speed_map_next_retry_at: null,
+      updated_at: startedAt
     },
     { onConflict: 'race_date,meeting_code,race_no' }
   )
 
-  if (upsertErr) {
-    throw new ExtractRaceError({ error: 'Failed to save race_metadata', details: upsertErr.message }, 500)
+  if (capturingErr) {
+    throw new ExtractRaceError({ error: 'Failed to mark speed map as capturing', details: capturingErr.message }, 500)
   }
 
-  return { captured: true, speedMapUrl }
+  try {
+    if (!readScreenshotConfig()) throw new Error('SCREENSHOT_API_KEY not configured')
+
+    await assertHkjcRaceExistsForSpeedMap(raceDate, meetingCode, raceNo)
+
+    const imageBytes = await captureValidatedSpeedMapImage(sourceUrl, { raceDate, meetingCode, raceNo })
+    const storagePath = speedMapStoragePath(raceDate, meetingCode, raceNo)
+
+    const { error: uploadErr } = await supabase.storage.from(SPEED_MAP_BUCKET).upload(storagePath, imageBytes, {
+      contentType: 'image/png',
+      upsert: true
+    })
+
+    if (uploadErr) throw new ExtractRaceError({ error: 'Speed map upload failed', details: uploadErr.message }, 500)
+
+    const { data: publicUrlData } = supabase.storage.from(SPEED_MAP_BUCKET).getPublicUrl(storagePath)
+    const speedMapUrl = publicUrlData.publicUrl
+    const capturedAt = new Date().toISOString()
+
+    const { error: upsertErr } = await supabase.from('race_metadata').upsert(
+      {
+        created_by: createdBy,
+        race_date: raceDate,
+        meeting_code: meetingCode,
+        race_no: raceNo,
+        speed_map_url: speedMapUrl,
+        speed_map_source_url: sourceUrl,
+        speed_map_status: 'completed',
+        speed_map_last_error: null,
+        speed_map_next_retry_at: null,
+        captured_at: capturedAt,
+        updated_at: capturedAt
+      },
+      { onConflict: 'race_date,meeting_code,race_no' }
+    )
+
+    if (upsertErr) {
+      throw new ExtractRaceError({ error: 'Failed to save race_metadata', details: upsertErr.message }, 500)
+    }
+
+    return { captured: true, speedMapUrl }
+  } catch (e) {
+    const message = formatExtractionError(e).slice(0, 1000)
+    const unavailable = /尚未|未有|未發布|not published|頁面未載入走位圖/i.test(message)
+    const retryMinutes = attemptCount <= 1 ? 1 : attemptCount === 2 ? 3 : 10
+    const failedAt = new Date().toISOString()
+    const nextRetryAt = new Date(Date.now() + retryMinutes * 60_000).toISOString()
+
+    await supabase
+      .from('race_metadata')
+      .update({
+        speed_map_status: unavailable ? 'unavailable' : 'retrying',
+        speed_map_last_error: message,
+        speed_map_next_retry_at: nextRetryAt,
+        updated_at: failedAt
+      })
+      .eq('race_date', raceDate)
+      .eq('meeting_code', meetingCode)
+      .eq('race_no', raceNo)
+
+    throw e
+  }
 }
 
 type SpeedMapRaceRef = {
@@ -346,7 +394,7 @@ function uniqueRacesSorted(races: SpeedMapRaceRef[]): SpeedMapRaceRef[] {
     if (!byKey.has(key)) byKey.set(key, race)
   }
   return [...byKey.values()].sort((a, b) => {
-    const byDate = a.raceDate.localeCompare(b.raceDate)
+    const byDate = b.raceDate.localeCompare(a.raceDate)
     if (byDate !== 0) return byDate
     const byMeeting = a.meetingCode.localeCompare(b.meetingCode)
     if (byMeeting !== 0) return byMeeting
@@ -365,13 +413,66 @@ async function hasSpeedMapUrl(supabase: ReturnType<typeof createClient>, race: S
   return Boolean(data?.speed_map_url)
 }
 
-/** Capture at most one missing speed map per invocation (avoids Edge timeout + Browserless rate limits). */
-async function captureOneMissingSpeedMap(
+async function ensurePendingSpeedMapMetadata(
   supabase: ReturnType<typeof createClient>,
-  races: SpeedMapRaceRef[]
+  race: SpeedMapRaceRef
 ) {
+  const { data } = await supabase
+    .from('race_metadata')
+    .select('id')
+    .eq('race_date', race.raceDate)
+    .eq('meeting_code', race.meetingCode)
+    .eq('race_no', race.raceNo)
+    .maybeSingle()
+
+  if (data) return
+
+  await supabase.from('race_metadata').insert({
+    created_by: race.createdBy,
+    race_date: race.raceDate,
+    meeting_code: race.meetingCode,
+    race_no: race.raceNo,
+    speed_map_status: 'pending',
+    speed_map_source_url: buildSpeedMapUrl(race.raceNo)
+  })
+}
+
+async function speedMapRetryIsDue(
+  supabase: ReturnType<typeof createClient>,
+  race: SpeedMapRaceRef
+) {
+  const { data } = await supabase
+    .from('race_metadata')
+    .select('speed_map_url,speed_map_status,speed_map_next_retry_at,updated_at')
+    .eq('race_date', race.raceDate)
+    .eq('meeting_code', race.meetingCode)
+    .eq('race_no', race.raceNo)
+    .maybeSingle()
+
+  if (data?.speed_map_url) return false
+  if (
+    data?.speed_map_status === 'capturing' &&
+    data.updated_at &&
+    new Date(data.updated_at).getTime() > Date.now() - 2 * 60_000
+  ) {
+    return false
+  }
+  if (!data?.speed_map_next_retry_at) return true
+  return new Date(data.speed_map_next_retry_at).getTime() <= Date.now()
+}
+
+/** Capture at most two missing speed maps per invocation. */
+async function captureMissingSpeedMaps(
+  supabase: ReturnType<typeof createClient>,
+  races: SpeedMapRaceRef[],
+  limit = 2
+) {
+  let attempted = 0
   for (const race of uniqueRacesSorted(races)) {
-    if (await hasSpeedMapUrl(supabase, race)) continue
+    if (attempted >= limit) break
+    if (!(await speedMapRetryIsDue(supabase, race))) continue
+    attempted += 1
+
     try {
       await ensureSpeedMapCaptured(supabase, race)
     } catch (e) {
@@ -380,7 +481,6 @@ async function captureOneMissingSpeedMap(
         formatExtractionError(e)
       )
     }
-    return
   }
 }
 
@@ -397,8 +497,18 @@ async function loadRacesMissingSpeedMapsFromCompletedJobs(
   if (error || !jobs?.length) return []
 
   const missing: SpeedMapRaceRef[] = []
-  for (const race of uniqueRacesSorted(jobs as SpeedMapRaceRef[])) {
-    if (!(await hasSpeedMapUrl(supabase, race))) missing.push(race)
+  const races = jobs.map((job) => ({
+    createdBy: job.created_by,
+    raceDate: job.race_date,
+    meetingCode: job.meeting_code,
+    raceNo: job.race_no
+  }))
+
+  for (const race of uniqueRacesSorted(races)) {
+    if (!(await hasSpeedMapUrl(supabase, race))) {
+      await ensurePendingSpeedMapMetadata(supabase, race)
+      missing.push(race)
+    }
   }
   return missing
 }
@@ -710,7 +820,7 @@ export async function processDueExtractionJobs(
 
   const missingRaces = await loadRacesMissingSpeedMapsFromCompletedJobs(supabase)
   if (missingRaces.length) {
-    await captureOneMissingSpeedMap(supabase, missingRaces)
+    await captureMissingSpeedMaps(supabase, missingRaces, 2)
   }
 
   return { ok: true, processed: allResults.length, results: allResults }

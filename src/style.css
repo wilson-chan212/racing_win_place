@@ -648,6 +648,24 @@ select.controlSelect:disabled {
   color: var(--text);
 }
 
+.speedMapBlock--status {
+  min-height: 74px;
+}
+
+.speedMapStatus {
+  font-size: 14px;
+  font-weight: 700;
+  color: #667085;
+}
+
+.speedMapStatus--unavailable {
+  color: #8a6116;
+}
+
+.speedMapStatus--retrying {
+  color: #b42318;
+}
+
 .speedMapSourceLink {
   font-size: 12px;
   color: var(--accent);
