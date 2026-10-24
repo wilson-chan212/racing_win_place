@@ -1,4 +1,5 @@
-// HKJC GraphQL — same allowlisted query shape as supabase/functions/extract-race-results
+// HKJC GraphQL — same allowlisted query shape as supabase/functions/_shared/race-extraction.ts.
+// activeMeetings must include poolInvs { status }. Omitting it makes HKJC return WHITELIST_ERROR.
 
 export const HKJC_GRAPHQL_URL = 'https://info.cld.hkjc.com/graphql/base/'
 
@@ -94,6 +95,9 @@ query raceMeetings($date: String, $venueCode: String) {
  postTime
  status
  wageringFieldSize
+ }
+ poolInvs: pmPools(oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]) {
+ status
  }
  }
  raceMeetings(date: $date, venueCode: $venueCode) {

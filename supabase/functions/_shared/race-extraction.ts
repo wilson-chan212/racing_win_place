@@ -826,9 +826,9 @@ export async function processDueExtractionJobs(
   return { ok: true, processed: allResults.length, results: allResults }
 }
 
-/** Must match HKJC's allowlisted operation shape (see horseOddsQuery in community hkjc-api). Extra top-level fields → WHITELIST_ERROR. */
+/** Must match HKJC's allowlisted operation shape. Extra or missing fields → WHITELIST_ERROR. */
 const HKJC_ODDS_QUERY = `
-query racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {
+query sp4e_racing_pmPool($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {
  raceMeetings(date: $date, venueCode: $venueCode) {
  pmPools(oddsTypes: $oddsTypes, raceNo: $raceNo) {
  id
@@ -836,6 +836,7 @@ query racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo:
  sellStatus
  oddsType
  lastUpdateTime
+ oddsLastUpdateTime
  guarantee
  minTicketCost
  name_en
@@ -956,6 +957,9 @@ query raceMeetings($date: String, $venueCode: String) {
  postTime
  status
  wageringFieldSize
+ }
+ poolInvs: pmPools(oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]) {
+ status
  }
  }
  raceMeetings(date: $date, venueCode: $venueCode) {
@@ -1125,7 +1129,7 @@ async function fetchGraphqlOdds(raceDate: string, meetingCode: string, raceNo: n
       raceNo,
       oddsTypes: ['WIN', 'PLA']
     },
-    { operationName: 'racing', referer: racePageReferer }
+    { operationName: 'sp4e_racing_pmPool', referer: racePageReferer }
   )
 
   const meeting = oddsData?.raceMeetings?.[0]
